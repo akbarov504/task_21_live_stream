@@ -1,0 +1,510 @@
+<!doctype html>
+<html lang="uz">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>🎥 WebRTC Video & Audio Live Stream Test</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif; padding: 20px; background: #0f172a; color: #f8fafc; margin: 0; }
+    .container { max-width: 1200px; margin: 0 auto; }
+    header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #334155; padding-bottom: 15px; margin-bottom: 20px; }
+    h1 { margin: 0; font-size: 22px; color: #38bdf8; display: flex; align-items: center; gap: 10px; }
+    .status-badge { display: inline-flex; align-items: center; gap: 8px; padding: 6px 16px; border-radius: 9999px; font-size: 13px; font-weight: 600; }
+    .status-badge.idle { background: #334155; color: #94a3b8; }
+    .status-badge.connecting { background: #ca8a04; color: #fef08a; }
+    .status-badge.connected { background: #15803d; color: #bbf7d0; }
+    .status-badge.error { background: #b91c1c; color: #fecaca; }
+    
+    .grid-layout { display: grid; grid-template-columns: 380px 1fr; gap: 20px; }
+    
+    .panel { background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 20px; }
+    .panel-title { font-size: 16px; font-weight: 700; color: #94a3b8; margin-top: 0; margin-bottom: 15px; text-transform: uppercase; letter-spacing: 0.5px; }
+    
+    .form-group { margin-bottom: 14px; }
+    label { display: block; font-size: 12px; font-weight: 600; color: #cbd5e1; margin-bottom: 5px; }
+    input, select {
+      width: 100%; padding: 10px 12px; background: #0f172a; color: #f8fafc;
+      border: 1px solid #475569; border-radius: 8px; font-size: 14px; outline: none; transition: border-color .2s;
+    }
+    input:focus, select:focus { border-color: #38bdf8; }
+    
+    .checkbox-group { display: flex; align-items: center; gap: 10px; margin: 15px 0; }
+    .checkbox-group input { width: auto; margin: 0; cursor: pointer; }
+    .checkbox-group label { margin: 0; cursor: pointer; font-size: 14px; }
+    
+    .btn-group { display: flex; flex-direction: column; gap: 10px; margin-top: 20px; }
+    button {
+      padding: 12px; border: none; border-radius: 8px; font-size: 14px; font-weight: 700;
+      cursor: pointer; transition: all .2s; display: flex; align-items: center; justify-content: center; gap: 8px;
+    }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .btn-connect { background: #0284c7; color: white; }
+    .btn-connect:hover:not(:disabled) { background: #0369a1; }
+    .btn-stream { background: #16a34a; color: white; }
+    .btn-stream:hover:not(:disabled) { background: #15803d; }
+    .btn-stop { background: #dc2626; color: white; }
+    .btn-stop:hover:not(:disabled) { background: #b91c1c; }
+    
+    .video-container {
+      position: relative; background: #000; border-radius: 12px; overflow: hidden;
+      aspect-ratio: 16 / 9; display: flex; align-items: center; justify-content: center; border: 1px solid #334155;
+    }
+    video { width: 100%; height: 100%; object-fit: contain; }
+    .video-placeholder {
+      position: absolute; text-align: center; color: #64748b; font-size: 16px;
+      display: flex; flex-direction: column; align-items: center; gap: 10px;
+    }
+    
+    pre#log {
+      background: #020617; color: #4ade80; padding: 14px; border-radius: 8px;
+      height: 240px; overflow-y: auto; font-family: "SFMono-Regular", Consolas, Menlo, monospace;
+      font-size: 12px; line-height: 1.5; margin-top: 15px; border: 1px solid #1e293b;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>📹 WebRTC Live Stream Dashboard</h1>
+      <span id="statusBadge" class="status-badge idle">● Ulanmagan</span>
+    </header>
+
+    <div class="grid-layout">
+      <!-- Control Panel -->
+      <div class="panel">
+        <h3 class="panel-title">Sozlamalar & Boshqaruv</h3>
+        
+        <div class="form-group">
+          <label>Bearer Token</label>
+          <input id="token" placeholder="eyJhbGciOi..." />
+        </div>
+
+        <div class="form-group">
+          <label>Serial Number (MiniPC)</label>
+          <input id="serialNumber" value="f290c3c97361b8e3" placeholder="f290c3c97361b8e3" />
+        </div>
+
+        <div class="form-group">
+          <label>MiniPC Session ID (Python terminal logidan)</label>
+          <input id="miniSid" placeholder="masalan: ax79yt12" />
+        </div>
+
+        <div class="form-group">
+          <label>Kamera Rejimi</label>
+          <select id="cameraMode">
+            <option value="in">Ichki Kamera (IN - Salon)</option>
+            <option value="out">Tashqi Kamera (OUT - Yo'l)</option>
+            <option value="all" selected>Ikkala Kamera (ALL - Yonma-yon)</option>
+          </select>
+        </div>
+
+        <div class="form-group">
+          <label>Video Sifati (Kachestva)</label>
+          <select id="quality">
+            <option value="480p">480p (SD 640x480)</option>
+            <option value="720p" selected>720p (HD 1280x720)</option>
+            <option value="1080p">1080p (FullHD 1920x1080)</option>
+            <option value="2k">2K (QHD 2560x1440)</option>
+          </select>
+        </div>
+
+        <div class="checkbox-group">
+          <input type="checkbox" id="audioToggle" checked />
+          <label for="audioToggle">🎙️ Ovozni uzatish (Audio stream)</label>
+        </div>
+
+        <div class="btn-group">
+          <button id="btnConnect" class="btn-connect">1. WS & STOMP Ulanish</button>
+          <button id="btnStart" class="btn-stream" disabled>2. 🎥 START LIVE STREAM</button>
+          <button id="btnStop" class="btn-stop" disabled>3. ⏹️ STOP STREAM</button>
+        </div>
+      </div>
+
+      <!-- Live Video View & Logs -->
+      <div style="display: flex; flex-direction: column; gap: 20px;">
+        <div class="panel" style="padding: 10px;">
+          <div class="video-container">
+            <video id="remoteVideo" autoplay playsinline controls></video>
+            <div id="videoPlaceholder" class="video-placeholder">
+              <svg width="48" height="48" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M4 6h9a2 2 0 012 2v8a2 2 0 01-2 2H4a2 2 0 01-2-2V8a2 2 0 012-2z"></path></svg>
+              <span>Jonli video stream kutilmoqda...</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel" style="flex: 1;">
+          <h3 class="panel-title" style="margin-bottom: 5px;">Signaling & WebRTC Jurnali</h3>
+          <pre id="log"></pre>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const WS_BASE   = "wss://dev-gw.tracksafe365.com/services/glsstream/stream";
+    const SEND_DEST = "/app/send/signal";
+    const SIGNAL_TOPIC_BASE = "/topic/video/stream/signal";
+    const NULL_CHAR = "\x00";
+
+    let ws = null;
+    let webSid = null;
+    let isStompConnected = false;
+    let pc = null;
+    let pendingIceFromServer = [];
+    let remoteDescriptionSet = false;
+
+    const elLog = document.getElementById("log");
+    const elStatus = document.getElementById("statusBadge");
+    const elVideo = document.getElementById("remoteVideo");
+    const elPlaceholder = document.getElementById("videoPlaceholder");
+    const btnConnect = document.getElementById("btnConnect");
+    const btnStart = document.getElementById("btnStart");
+    const btnStop = document.getElementById("btnStop");
+
+    function log(...args) {
+      const ts = new Date().toLocaleTimeString();
+      const s = args.map(a => typeof a === "string" ? a : JSON.stringify(a, null, 2)).join(" ");
+      elLog.textContent += `[${ts}] ${s}\n`;
+      elLog.scrollTop = elLog.scrollHeight;
+      console.log(...args);
+    }
+
+    function setStatus(text, type = "idle") {
+      elStatus.textContent = "● " + text;
+      elStatus.className = "status-badge " + type;
+    }
+
+    function randInt(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
+    function genServerId() { return String(randInt(0, 999)).padStart(3, "0"); }
+    function genSessionId(n = 8) {
+      const abc = "abcdefghijklmnopqrstuvwxyz0123456789";
+      return Array.from({length: n}, () => abc[Math.floor(Math.random() * abc.length)]).join("");
+    }
+
+    function buildFrame(command, headers = {}, body = "") {
+      const lines = [command];
+      for (const [k, v] of Object.entries(headers)) lines.push(`${k}:${v}`);
+      lines.push("");
+      return lines.join("\n") + "\n" + (body || "") + NULL_CHAR;
+    }
+
+    function parseFrame(raw) {
+      raw = raw.replace(/^\n+/, "");
+      const ni = raw.indexOf(NULL_CHAR);
+      if (ni >= 0) raw = raw.slice(0, ni);
+      const [head, ...rest] = raw.split("\n\n");
+      const body = rest.join("\n\n");
+      const lines = head.split("\n");
+      const cmd = (lines[0] || "").trim();
+      const headers = {};
+      for (const line of lines.slice(1)) {
+        const p = line.indexOf(":");
+        if (p > 0) headers[line.slice(0, p).trim()] = line.slice(p + 1).trim();
+      }
+      return { cmd, headers, body };
+    }
+
+    function sockjsSend(frame) {
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        log("❌ WS yopiq, frame yuborilmadi");
+        return;
+      }
+      ws.send(JSON.stringify([frame]));
+    }
+
+    function stompSendJson(dest, obj) {
+      const body = JSON.stringify(obj);
+      const bodyBytes = new TextEncoder().encode(body).length;
+      sockjsSend(buildFrame("SEND", {
+        "destination": dest,
+        "content-type": "application/json",
+        "content-length": String(bodyBytes),
+      }, body));
+      log("OUT →", obj.type || obj.data?.type || "SIGNAL", "| dest:", dest);
+    }
+
+    // ── STOMP Connection ──────────────────────────────────────
+    function connectStomp() {
+      const token = document.getElementById("token").value.trim();
+      const serialNumber = document.getElementById("serialNumber").value.trim();
+      const miniSid = document.getElementById("miniSid").value.trim();
+
+      if (!token) { alert("Iltimos, Bearer Token kiriting!"); return; }
+      if (!serialNumber) { alert("Serial Number kiriting!"); return; }
+
+      const serverId = genServerId();
+      webSid = genSessionId(8);
+      const url = `${WS_BASE}/${serverId}/${webSid}/websocket`;
+
+      log("WS ulanmoqda:", url);
+      setStatus("Ulanmoqda...", "connecting");
+
+      ws = new WebSocket(url);
+
+      ws.onopen = () => {
+        log("WS ochiq ✅ STOMP CONNECT yuborilmoqda...");
+        sockjsSend(buildFrame("CONNECT", {
+          "accept-version": "1.2",
+          "host": "dev-gw.tracksafe365.com",
+          "Authorization": `Bearer ${token}`,
+          "heart-beat": "10000,10000",
+        }));
+      };
+
+      ws.onmessage = async (ev) => {
+        const msg = ev.data;
+        if (msg === "o" || msg === "h") return;
+        if (typeof msg === "string" && msg.startsWith("c")) {
+          log("SockJS CLOSE:", msg);
+          return;
+        }
+
+        if (typeof msg === "string" && msg.startsWith("a")) {
+          let frames;
+          try { frames = JSON.parse(msg.slice(1)); } catch (e) { return; }
+
+          for (const fr of frames) {
+            const { cmd, headers, body } = parseFrame(fr);
+
+            if (cmd === "CONNECTED") {
+              isStompConnected = true;
+              log("STOMP CONNECTED ✅");
+              setStatus("STOMP Ulandi", "connected");
+              btnStart.disabled = false;
+              btnConnect.disabled = true;
+
+              // Subscribe to our web signal topic
+              const webSigTopic = `${SIGNAL_TOPIC_BASE}/admin/${webSid}`;
+              sockjsSend(buildFrame("SUBSCRIBE", { id: "sub-web-sig", destination: webSigTopic, ack: "auto" }));
+              log("SUBSCRIBED to:", webSigTopic);
+              continue;
+            }
+
+            if (cmd === "ERROR") {
+              log("STOMP ERROR:", headers, body.slice(0, 300));
+              setStatus("STOMP Xato", "error");
+              continue;
+            }
+
+            if (cmd === "MESSAGE") {
+              const dest = headers.destination || "";
+              try {
+                const raw = JSON.parse(body);
+                const payload = (raw && typeof raw === "object" && "data" in raw) ? raw.data : raw;
+                await handleSignal(payload);
+              } catch (e) {
+                log("JSON parse xatosi:", e, body);
+              }
+            }
+          }
+        }
+      };
+
+      ws.onerror = (e) => {
+        log("WS Xato:", e.message || String(e));
+        setStatus("WS Xato", "error");
+      };
+
+      ws.onclose = () => {
+        isStompConnected = false;
+        log("WS Yopildi");
+        setStatus("Ulanmagan", "idle");
+        btnStart.disabled = true;
+        btnConnect.disabled = false;
+      };
+    }
+
+    // ── WebRTC Setup ──────────────────────────────────────────
+    function createPeerConnection() {
+      if (pc) {
+        try { pc.close(); } catch (e) {}
+      }
+
+      pc = new RTCPeerConnection({
+        iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
+      });
+      remoteDescriptionSet = false;
+      pendingIceFromServer = [];
+
+      pc.ontrack = (event) => {
+        log(`📡 Remote Track qabul qilindi: kind=${event.track.kind}`);
+        if (event.streams && event.streams[0]) {
+          elVideo.srcObject = event.streams[0];
+          elPlaceholder.style.display = "none";
+          log("🎥 Video oqimi playerga ulandi!");
+        }
+      };
+
+      pc.onicecandidate = (event) => {
+        if (!event.candidate) return;
+        const serialNumber = document.getElementById("serialNumber").value.trim();
+        const miniSid = document.getElementById("miniSid").value.trim();
+
+        const icePayload = {
+          type: "ICE_TO_MINIPC",
+          fromUsername: "admin",
+          fromSessionId: webSid,
+          serialNumber: serialNumber,
+          toUsername: serialNumber,
+          toSessionId: miniSid,
+          candidate: {
+            candidate: event.candidate.candidate,
+            sdpMid: event.candidate.sdpMid,
+            sdpMLineIndex: event.candidate.sdpMLineIndex,
+          }
+        };
+        stompSendJson(SEND_DEST, icePayload);
+        log("ICE_TO_MINIPC yuborildi 📡");
+      };
+
+      pc.onconnectionstatechange = () => {
+        log("WebRTC ConnectionState:", pc.connectionState);
+        if (pc.connectionState === "connected") {
+          setStatus("Jonli Efirda 🎥", "connected");
+        } else if (pc.connectionState === "failed" || pc.connectionState === "closed") {
+          setStatus("Stream Uzildi", "error");
+        }
+      };
+    }
+
+    // ── Signal Handler ────────────────────────────────────────
+    async function handleSignal(payload) {
+      const type = payload.type;
+      log("SIGNAL IN ←", type);
+
+      if (type === "OFFER") {
+        log("MiniPC dan SDP OFFER keldi! ANSWER tayyorlanmoqda...");
+        createPeerConnection();
+
+        try {
+          await pc.setRemoteDescription(new RTCSessionDescription({ type: "offer", sdp: payload.sdp }));
+          remoteDescriptionSet = true;
+          log("Remote OFFER o'rnatildi ✅");
+
+          // Process queued ICE candidates
+          for (const cand of pendingIceFromServer) {
+            await pc.addIceCandidate(cand);
+          }
+          pendingIceFromServer = [];
+
+          // Create and send SDP ANSWER
+          const answer = await pc.createAnswer();
+          await pc.setLocalDescription(answer);
+          log("Local SDP ANSWER yaratildi ✅");
+
+          const serialNumber = document.getElementById("serialNumber").value.trim();
+          const miniSid = document.getElementById("miniSid").value.trim();
+
+          const answerPayload = {
+            type: "ANSWER",
+            sdp: pc.localDescription.sdp,
+            fromUsername: "admin",
+            fromSessionId: webSid,
+            serialNumber: serialNumber,
+            toUsername: serialNumber,
+            toSessionId: miniSid,
+          };
+
+          const dest = `${SIGNAL_TOPIC_BASE}/${serialNumber}/${miniSid}`;
+          stompSendJson(dest, answerPayload);
+          log("SDP ANSWER MiniPC ga yuborildi 🚀");
+        } catch (e) {
+          log("OFFER/ANSWER xatosi:", e);
+        }
+        return;
+      }
+
+      if (type === "ICE_TO_WEB") {
+        const c = payload.candidate;
+        if (!c || !c.candidate) return;
+
+        const candidate = new RTCIceCandidate({
+          candidate: c.candidate,
+          sdpMid: c.sdpMid,
+          sdpMLineIndex: c.sdpMLineIndex,
+        });
+
+        if (!remoteDescriptionSet || !pc) {
+          pendingIceFromServer.push(candidate);
+          log("Server ICE navbatga qo'yildi (ANSWER kutilmoqda)");
+        } else {
+          try {
+            await pc.addIceCandidate(candidate);
+            log("Server ICE qo'shildi ✅");
+          } catch (e) {
+            log("addIceCandidate xatosi:", e);
+          }
+        }
+      }
+    }
+
+    // ── Actions ───────────────────────────────────────────────
+    function startStream() {
+      const serialNumber = document.getElementById("serialNumber").value.trim();
+      const miniSid = document.getElementById("miniSid").value.trim();
+      const cameraMode = document.getElementById("cameraMode").value;
+      const quality = document.getElementById("quality").value;
+      const audioEnabled = document.getElementById("audioToggle").checked;
+
+      if (!miniSid) {
+        alert("Iltimos, MiniPC Session ID ni kiriting (Python logidan oling)!");
+        return;
+      }
+
+      log(`START_STREAM so'rovi yuborilmoqda: mode=${cameraMode}, quality=${quality}, audio=${audioEnabled}`);
+
+      const startPayload = {
+        type: "START_STREAM",
+        fromUsername: "admin",
+        fromSessionId: webSid,
+        serialNumber: serialNumber,
+        toUsername: serialNumber,
+        toSessionId: miniSid,
+        cameraMode: cameraMode,
+        quality: quality,
+        audio: audioEnabled,
+      };
+
+      const dest = `${SIGNAL_TOPIC_BASE}/${serialNumber}/${miniSid}`;
+      stompSendJson(dest, startPayload);
+      setStatus("Stream so'ralmoqda...", "connecting");
+      btnStop.disabled = false;
+    }
+
+    function stopStream() {
+      const serialNumber = document.getElementById("serialNumber").value.trim();
+      const miniSid = document.getElementById("miniSid").value.trim();
+
+      const stopPayload = {
+        type: "STOP_STREAM",
+        fromUsername: "admin",
+        fromSessionId: webSid,
+        serialNumber: serialNumber,
+        toUsername: serialNumber,
+        toSessionId: miniSid,
+      };
+
+      const dest = `${SIGNAL_TOPIC_BASE}/${serialNumber}/${miniSid}`;
+      stompSendJson(dest, stopPayload);
+
+      if (pc) {
+        pc.close();
+        pc = null;
+      }
+      if (elVideo.srcObject) {
+        elVideo.srcObject.getTracks().forEach(t => t.stop());
+        elVideo.srcObject = null;
+      }
+      elPlaceholder.style.display = "flex";
+      log("Stream to'xtatildi ⏹️");
+      setStatus("To'xtatildi", "idle");
+      btnStop.disabled = true;
+    }
+
+    btnConnect.onclick = connectStomp;
+    btnStart.onclick = startStream;
+    btnStop.onclick = stopStream;
+  </script>
+</body>
+</html>
