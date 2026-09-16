@@ -58,16 +58,19 @@ class SyntheticFFmpegTrack(MediaStreamTrack):
 class FFmpegCameraTrack(MediaStreamTrack):
     """
     High-performance, low-CPU camera track backed by native FFmpeg (libavdevice / V4L2).
-    Streams MJPEG / YUYV directly from hardware without OpenCV overhead.
+    Streams MJPEG directly from hardware with smart resolution ladder and USB bandwidth auto-recovery.
     """
     kind = "video"
 
     def __init__(self, source: str, quality: str = DEFAULT_QUALITY, name: str = "Camera"):
         super().__init__()
         prof = QUALITY_PROFILES.get(quality.lower(), QUALITY_PROFILES["720p"])
-        self.width = prof["width"]
-        self.height = prof["height"]
-        self.fps = prof["fps"]
+        self.target_width = prof["width"]
+        self.target_height = prof["height"]
+        self.target_fps = prof["fps"]
+        self.width = self.target_width
+        self.height = self.target_height
+        self.fps = self.target_fps
         self.name = name
         self.source = str(source)
         self.player: Optional[MediaPlayer] = None
@@ -76,38 +79,67 @@ class FFmpegCameraTrack(MediaStreamTrack):
         self._init_ffmpeg_player()
 
     def _init_ffmpeg_player(self):
-        print(f"[FFMPEG CAMERA] Opening {self.name} via FFmpeg V4L2: source={self.source}, {self.width}x{self.height}@{self.fps}fps")
-
         is_linux = platform.system() == "Linux"
         fmt = "v4l2" if is_linux else None
 
-        # Try MJPEG hardware decoding first (highest FPS, lowest CPU)
-        options = {
-            "video_size": f"{self.width}x{self.height}",
-            "framerate": str(self.fps),
-            "input_format": "mjpeg",
-        }
+        # Ladder of resolutions to try if USB bus bandwidth (ENOSPC / Errno 28) is saturated
+        resolutions_to_try = [
+            (self.target_width, self.target_height, self.target_fps),
+            (1920, 1080, 30),
+            (1280, 720, 30),
+            (640, 480, 25),
+        ]
 
-        try:
-            if is_linux and (os.path.exists(self.source) or self.source.startswith("/dev/")):
-                self.player = MediaPlayer(self.source, format=fmt, options=options)
-                print(f"[FFMPEG CAMERA] {self.name} opened with MJPEG V4L2 ✅")
-            else:
-                raise RuntimeError(f"Device {self.source} not found on this system")
-        except Exception as e1:
-            print(f"[FFMPEG CAMERA] MJPEG open warning ({e1}), trying raw V4L2...")
+        seen = set()
+        unique_resolutions = []
+        for w, h, fps in resolutions_to_try:
+            if (w, h) not in seen:
+                seen.add((w, h))
+                unique_resolutions.append((w, h, fps))
+
+        opened = False
+        for w, h, fps in unique_resolutions:
+            options_mjpeg = {
+                "video_size": f"{w}x{h}",
+                "framerate": str(fps),
+                "input_format": "mjpeg",
+            }
+            print(f"[FFMPEG CAMERA] Opening {self.name} via V4L2 MJPEG: {w}x{h}@{fps}fps (device={self.source})...")
             try:
-                # Fallback to standard V4L2 format
-                raw_options = {
-                    "video_size": f"{self.width}x{self.height}",
-                    "framerate": str(self.fps),
-                }
-                self.player = MediaPlayer(self.source, format=fmt, options=raw_options)
-                print(f"[FFMPEG CAMERA] {self.name} opened with raw V4L2 ✅")
-            except Exception as e2:
-                print(f"[FFMPEG CAMERA] Hardware open failed ({e2}). Switching to Synthetic fallback.")
-                self.player = None
-                self._fallback_track = SyntheticFFmpegTrack(self.width, self.height, self.fps, name=self.name)
+                if is_linux and (os.path.exists(self.source) or self.source.startswith("/dev/")):
+                    self.player = MediaPlayer(self.source, format=fmt, options=options_mjpeg)
+                    self.width = w
+                    self.height = h
+                    self.fps = fps
+                    opened = True
+                    print(f"[FFMPEG CAMERA] {self.name} opened successfully with MJPEG {w}x{h}@{fps}fps ✅")
+                    break
+                else:
+                    raise RuntimeError(f"Device {self.source} not accessible on this platform")
+            except Exception as e:
+                err_str = str(e)
+                print(f"[FFMPEG CAMERA] {self.name} failed at {w}x{h} ({err_str})")
+                if "No space left on device" in err_str or "Device or resource busy" in err_str:
+                    print(f"[FFMPEG CAMERA] USB bandwidth saturation detected! Stepping down resolution...")
+                    time.sleep(0.3)
+                    continue
+                # Try raw V4L2 without mjpeg as an intermediate step for this resolution
+                try:
+                    options_raw = {"video_size": f"{w}x{h}", "framerate": str(fps)}
+                    self.player = MediaPlayer(self.source, format=fmt, options=options_raw)
+                    self.width = w
+                    self.height = h
+                    self.fps = fps
+                    opened = True
+                    print(f"[FFMPEG CAMERA] {self.name} opened with raw V4L2 {w}x{h}@{fps}fps ✅")
+                    break
+                except Exception:
+                    continue
+
+        if not opened:
+            print(f"[FFMPEG CAMERA] Could not open physical device {self.source}. Using synthetic fallback.")
+            self.player = None
+            self._fallback_track = SyntheticFFmpegTrack(self.target_width, self.target_height, self.target_fps, name=self.name)
 
     async def recv(self) -> av.VideoFrame:
         if self.player and self.player.video:
@@ -122,7 +154,6 @@ class FFmpegCameraTrack(MediaStreamTrack):
         if self._fallback_track:
             return await self._fallback_track.recv()
 
-        # Last resort black frame
         frame = av.VideoFrame(self.width, self.height, "yuv420p")
         pts, time_base = await self.next_timestamp()
         frame.pts = pts
@@ -156,11 +187,15 @@ def create_video_tracks(camera_mode: str = "all", quality: str = DEFAULT_QUALITY
     elif mode == "out":
         return [FFmpegCameraTrack(source=OUT_VIDEO_DEVICE, quality=quality, name="Out-Camera")]
     elif mode in ("all", "both"):
+        # In dual camera mode, open In-Camera first then Out-Camera
         track_in = FFmpegCameraTrack(source=IN_VIDEO_DEVICE, quality=quality, name="In-Camera")
+        # Short 200ms delay to allow USB host controller bandwidth allocation to settle
+        time.sleep(0.2)
         track_out = FFmpegCameraTrack(source=OUT_VIDEO_DEVICE, quality=quality, name="Out-Camera")
         return [track_in, track_out]
     else:
         print(f"[CAMERA FACTORY] Unknown mode '{mode}', defaulting to 'all'")
         track_in = FFmpegCameraTrack(source=IN_VIDEO_DEVICE, quality=quality, name="In-Camera")
+        time.sleep(0.2)
         track_out = FFmpegCameraTrack(source=OUT_VIDEO_DEVICE, quality=quality, name="Out-Camera")
         return [track_in, track_out]

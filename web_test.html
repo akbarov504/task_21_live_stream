@@ -415,17 +415,28 @@
 
         if (event.track.kind === "video") {
           videoTracksCount++;
-          const stream = event.streams && event.streams[0] ? event.streams[0] : new MediaStream([event.track]);
+          // Create isolated MediaStream per track so both players never mirror the same camera
+          const singleStream = new MediaStream([event.track]);
 
           if (videoTracksCount === 1) {
-            vPlayer1.srcObject = stream;
+            vPlayer1.srcObject = singleStream;
             vPlayer1.muted = true;
+            vPlayer1.onloadedmetadata = () => {
+              const resTag = `${vPlayer1.videoWidth}x${vPlayer1.videoHeight}`;
+              document.getElementById("lblCam1").textContent = `CAM 1 (ICHKI / IN) [${resTag}]`;
+              log(`📐 CAM 1 Aniq O'lchami: ${resTag}`);
+            };
             vPlayer1.play().catch(e => log("Video 1 play error:", e));
             phCam1.style.display = "none";
             log("🎥 Video Track 1 -> CAM 1 ga ulandi!");
           } else if (videoTracksCount >= 2) {
-            vPlayer2.srcObject = stream;
+            vPlayer2.srcObject = singleStream;
             vPlayer2.muted = true;
+            vPlayer2.onloadedmetadata = () => {
+              const resTag = `${vPlayer2.videoWidth}x${vPlayer2.videoHeight}`;
+              document.getElementById("lblCam2").textContent = `CAM 2 (TASHQI / OUT) [${resTag}]`;
+              log(`📐 CAM 2 Aniq O'lchami: ${resTag}`);
+            };
             vPlayer2.play().catch(e => log("Video 2 play error:", e));
             phCam2.style.display = "none";
             cardCam2.style.display = "flex";
@@ -433,8 +444,8 @@
             log("🎥 Video Track 2 -> CAM 2 ga ulandi!");
           }
         } else if (event.track.kind === "audio") {
-          const stream = event.streams && event.streams[0] ? event.streams[0] : new MediaStream([event.track]);
-          elAudio.srcObject = stream;
+          const audioStream = new MediaStream([event.track]);
+          elAudio.srcObject = audioStream;
           elAudio.play().catch(e => log("Audio play error:", e));
           log("🔊 Audio oqimi dinamikka ulandi!");
         }
