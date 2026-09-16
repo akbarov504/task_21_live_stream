@@ -76,7 +76,10 @@
         <h3 class="panel-title">Sozlamalar & Boshqaruv</h3>
         
         <div class="form-group">
-          <label>Bearer Token</label>
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 5px;">
+            <label style="margin: 0;">Bearer Token</label>
+            <button id="btnFetchLocal" type="button" style="padding: 2px 8px; font-size: 11px; background: #334155; color: #38bdf8; border: 1px solid #475569; border-radius: 4px; cursor: pointer; width: auto;">🔄 Local 8787 dan olish</button>
+          </div>
           <input id="token" placeholder="eyJhbGciOi..." />
         </div>
 
@@ -226,12 +229,39 @@
 
     // ── STOMP Connection ──────────────────────────────────────
     function connectStomp() {
-      const token = document.getElementById("token").value.trim();
+      let rawToken = document.getElementById("token").value.trim();
       const serialNumber = document.getElementById("serialNumber").value.trim();
       const miniSid = document.getElementById("miniSid").value.trim();
 
-      if (!token) { alert("Iltimos, Bearer Token kiriting!"); return; }
+      if (!rawToken) { alert("Iltimos, Bearer Token kiriting!"); return; }
       if (!serialNumber) { alert("Serial Number kiriting!"); return; }
+
+      // Clean up token formatting (strip accidental double 'Bearer ' or quotes)
+      rawToken = rawToken.replace(/^Bearer\s+/i, '').replace(/['"]/g, '').trim();
+      const authHeader = `Bearer ${rawToken}`;
+
+      // Inspect JWT Expiry
+      try {
+        const parts = rawToken.split('.');
+        if (parts.length === 3) {
+          const payload = JSON.parse(atob(parts[1].replace(/-/g, '+').replace(/_/g, '/')));
+          if (payload.exp) {
+            const expDate = new Date(payload.exp * 1000);
+            const now = new Date();
+            if (now >= expDate) {
+              log(`❌ XATOLIK: Token muddati o'tgan (Expired)!`);
+              log(`   Token tugash vaqti : ${expDate.toLocaleString()}`);
+              log(`   Hozirgi vaqt       : ${now.toLocaleString()}`);
+              alert(`❌ Kiritilgan Token muddati tugagan (Expired: ${expDate.toLocaleTimeString()})!\nIltimos, yangi token oling.`);
+              return;
+            } else {
+              log(`ℹ️ Token yaroqli ✅ (Tugash vaqti: ${expDate.toLocaleTimeString()})`);
+            }
+          }
+        }
+      } catch (e) {
+        log("⚠️ Token JWT parse ogohlantirish:", e.message);
+      }
 
       const serverId = genServerId();
       webSid = genSessionId(8);
@@ -247,7 +277,7 @@
         sockjsSend(buildFrame("CONNECT", {
           "accept-version": "1.2",
           "host": "dev-gw.tracksafe365.com",
-          "Authorization": `Bearer ${token}`,
+          "Authorization": authHeader,
           "heart-beat": "10000,10000",
         }));
       };
@@ -502,6 +532,30 @@
       btnStop.disabled = true;
     }
 
+    async function fetchLocalInfo() {
+      try {
+        log("Local 8787 dan Token olinmoqda...");
+        const resTok = await fetch("http://127.0.0.1:8787/token");
+        const dataTok = await resTok.json();
+        if (dataTok.token) {
+          document.getElementById("token").value = dataTok.token;
+          log("Token olindi ✅ Tugash vaqti:", dataTok.expires_at || "noma'lum");
+        }
+        
+        log("Local 8787 dan Info olinmoqda...");
+        const resInfo = await fetch("http://127.0.0.1:8787/info");
+        const dataInfo = await resInfo.json();
+        if (dataInfo.serialNumber) {
+          document.getElementById("serialNumber").value = dataInfo.serialNumber;
+          log("Serial Number olindi ✅:", dataInfo.serialNumber);
+        }
+      } catch (e) {
+        log("❌ Local 8787 ga ulanib bo'lmadi:", e.message);
+        alert("http://127.0.0.1:8787 ga ulanib bo'lmadi. Tokenni qo'lda kiriting.");
+      }
+    }
+
+    document.getElementById("btnFetchLocal").onclick = fetchLocalInfo;
     btnConnect.onclick = connectStomp;
     btnStart.onclick = startStream;
     btnStop.onclick = stopStream;
