@@ -1,254 +1,166 @@
 import asyncio
-import cv2
-import numpy as np
+import os
 import time
-import threading
+import platform
 from fractions import Fraction
-from typing import Optional, Tuple
-from av import VideoFrame
+from typing import Optional, List, Dict, Any
+import av
 from aiortc import MediaStreamTrack
+from aiortc.contrib.media import MediaPlayer
+
 from config import (
     QUALITY_PROFILES,
     DEFAULT_QUALITY,
-    CAMERA_IN_DEVICE,
-    CAMERA_OUT_DEVICE,
+    IN_VIDEO_DEVICE,
+    OUT_VIDEO_DEVICE,
 )
 
-def parse_device_source(device_str: str):
-    try:
-        return int(device_str)
-    except (ValueError, TypeError):
-        return device_str
+class SyntheticFFmpegTrack(MediaStreamTrack):
+    """
+    Lightweight synthetic video track using PyAV.
+    Used when physical V4L2 camera is unavailable (e.g. testing / missing hardware).
+    Consumes practically 0% CPU.
+    """
+    kind = "video"
 
-class CameraCaptureThread:
-    def __init__(self, source, width: int, height: int, fps: int, name: str = "Camera"):
-        self.source = source
+    def __init__(self, width: int = 1280, height: int = 720, fps: int = 30, name: str = "Camera"):
+        super().__init__()
         self.width = width
         self.height = height
         self.fps = fps
         self.name = name
+        self._time_base = Fraction(1, fps)
+        self._pts = 0
+        self._start_time = time.time()
+        print(f"[FFMPEG CAMERA] Using Synthetic FFmpeg Track for {self.name} ({width}x{height}@{fps}fps) ⚠️")
 
-        self.cap: Optional[cv2.VideoCapture] = None
-        self.running = False
-        self.thread: Optional[threading.Thread] = None
-        self.lock = threading.Lock()
-        self.latest_frame: Optional[np.ndarray] = None
-        self.is_hardware_available = False
-        self._start_capture()
+    async def recv(self) -> av.VideoFrame:
+        pts, time_base = await self.next_timestamp()
 
-    def _start_capture(self):
-        src = parse_device_source(self.source)
-        print(f"[CAMERA] Opening {self.name} (source={src}, target={self.width}x{self.height}@{self.fps}fps)...")
-        try:
-            if isinstance(src, int):
-                import platform
-                if platform.system() == "Linux":
-                    self.cap = cv2.VideoCapture(src, cv2.CAP_V4L2)
-                else:
-                    self.cap = cv2.VideoCapture(src)
-            else:
-                self.cap = cv2.VideoCapture(str(src))
+        # Create clean YUV420P frame (native WebRTC format, no conversions needed)
+        frame = av.VideoFrame(self.width, self.height, "yuv420p")
 
-            if self.cap and self.cap.isOpened():
-                self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
-                self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
-                self.cap.set(cv2.CAP_PROP_FPS, self.fps)
-                self.is_hardware_available = True
-                print(f"[CAMERA] {self.name} opened successfully ✅")
-            else:
-                print(f"[CAMERA] {self.name} device {src} not found/accessible. Using synthetic stream ⚠️")
-                self.is_hardware_available = False
-        except Exception as e:
-            print(f"[CAMERA] {self.name} open exception: {e}. Using synthetic stream ⚠️")
-            self.is_hardware_available = False
+        # Background color modulation
+        t = time.time() - self._start_time
+        y_val = int((t * 20) % 200) + 20
 
-        self.running = True
-        self.thread = threading.Thread(target=self._capture_loop, daemon=True)
-        self.thread.start()
+        # Fill planes with solid color pattern
+        for p in frame.planes:
+            p.update(bytes([y_val] * p.buffer_size))
 
-    def _generate_synthetic_frame(self, frame_idx: int) -> np.ndarray:
-        img = np.zeros((self.height, self.width, 3), dtype=np.uint8)
+        frame.pts = pts
+        frame.time_base = time_base
+        return frame
 
-        t = time.time()
-        c_r = int((np.sin(t) + 1) * 30)
-        c_b = int((np.cos(t) + 1) * 40) + 30
-        img[:] = (c_b, 20, c_r)
+    def stop_camera(self):
+        pass
 
-        cv2.rectangle(img, (0, 0), (self.width, 60), (30, 30, 30), -1)
-        cv2.putText(
-            img,
-            f"LIVE: {self.name.upper()} [TEST FEED]",
-            (20, 42),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1.0,
-            (0, 255, 128),
-            2,
-            cv2.LINE_AA,
-        )
-
-        cur_time = time.strftime("%Y-%m-%d %H:%M:%S")
-        cv2.putText(
-            img,
-            f"Time: {cur_time} | Frame: {frame_idx}",
-            (20, self.height - 40),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (220, 220, 220),
-            2,
-            cv2.LINE_AA,
-        )
-        cv2.putText(
-            img,
-            f"Resolution: {self.width}x{self.height} @ {self.fps}fps",
-            (20, self.height - 15),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (180, 180, 180),
-            1,
-            cv2.LINE_AA,
-        )
-
-        pos_x = int((np.sin(t * 2) + 1) / 2 * (self.width - 120)) + 60
-        pos_y = int((np.cos(t * 3) + 1) / 2 * (self.height - 200)) + 100
-        cv2.circle(img, (pos_x, pos_y), 28, (0, 165, 255), -1)
-        cv2.putText(img, "REC", (pos_x - 18, pos_y + 6), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
-
-        return img
-
-    def _capture_loop(self):
-        frame_idx = 0
-        frame_delay = 1.0 / max(1, self.fps)
-
-        while self.running:
-            loop_start = time.time()
-
-            if self.is_hardware_available and self.cap:
-                ret, frame = self.cap.read()
-                if ret and frame is not None:
-                    if frame.shape[1] != self.width or frame.shape[0] != self.height:
-                        frame = cv2.resize(frame, (self.width, self.height))
-                    with self.lock:
-                        self.latest_frame = frame
-                else:
-                    frame = self._generate_synthetic_frame(frame_idx)
-                    with self.lock:
-                        self.latest_frame = frame
-            else:
-                frame = self._generate_synthetic_frame(frame_idx)
-                with self.lock:
-                    self.latest_frame = frame
-
-            frame_idx += 1
-            elapsed = time.time() - loop_start
-            sleep_time = max(0.001, frame_delay - elapsed)
-            time.sleep(sleep_time)
-
-    def get_frame(self) -> Optional[np.ndarray]:
-        with self.lock:
-            if self.latest_frame is not None:
-                return self.latest_frame.copy()
-            return None
-
-    def stop(self):
-        self.running = False
-        if self.thread and self.thread.is_alive():
-            self.thread.join(timeout=1.0)
-        if self.cap:
-            try:
-                self.cap.release()
-            except Exception as e:
-                print(f"[CAMERA] Error releasing {self.name}: {e}")
-            self.cap = None
-        print(f"[CAMERA] {self.name} capture stopped.")
-
-class SingleCameraTrack(MediaStreamTrack):
+class FFmpegCameraTrack(MediaStreamTrack):
+    """
+    High-performance, low-CPU camera track backed by native FFmpeg (libavdevice / V4L2).
+    Streams MJPEG / YUYV directly from hardware without OpenCV overhead.
+    """
     kind = "video"
 
-    def __init__(self, source, quality: str = DEFAULT_QUALITY, name: str = "Camera"):
+    def __init__(self, source: str, quality: str = DEFAULT_QUALITY, name: str = "Camera"):
         super().__init__()
         prof = QUALITY_PROFILES.get(quality.lower(), QUALITY_PROFILES["720p"])
         self.width = prof["width"]
         self.height = prof["height"]
         self.fps = prof["fps"]
         self.name = name
+        self.source = str(source)
+        self.player: Optional[MediaPlayer] = None
+        self._fallback_track: Optional[MediaStreamTrack] = None
 
-        self.reader = CameraCaptureThread(source, self.width, self.height, self.fps, name=self.name)
-        self._pts = 0
-        self._time_base = Fraction(1, self.fps)
-        self._frame_interval = 1.0 / self.fps
+        self._init_ffmpeg_player()
 
-    async def recv(self) -> VideoFrame:
+    def _init_ffmpeg_player(self):
+        print(f"[FFMPEG CAMERA] Opening {self.name} via FFmpeg V4L2: source={self.source}, {self.width}x{self.height}@{self.fps}fps")
+
+        is_linux = platform.system() == "Linux"
+        fmt = "v4l2" if is_linux else None
+
+        # Try MJPEG hardware decoding first (highest FPS, lowest CPU)
+        options = {
+            "video_size": f"{self.width}x{self.height}",
+            "framerate": str(self.fps),
+            "input_format": "mjpeg",
+        }
+
+        try:
+            if is_linux and (os.path.exists(self.source) or self.source.startswith("/dev/")):
+                self.player = MediaPlayer(self.source, format=fmt, options=options)
+                print(f"[FFMPEG CAMERA] {self.name} opened with MJPEG V4L2 ✅")
+            else:
+                raise RuntimeError(f"Device {self.source} not found on this system")
+        except Exception as e1:
+            print(f"[FFMPEG CAMERA] MJPEG open warning ({e1}), trying raw V4L2...")
+            try:
+                # Fallback to standard V4L2 format
+                raw_options = {
+                    "video_size": f"{self.width}x{self.height}",
+                    "framerate": str(self.fps),
+                }
+                self.player = MediaPlayer(self.source, format=fmt, options=raw_options)
+                print(f"[FFMPEG CAMERA] {self.name} opened with raw V4L2 ✅")
+            except Exception as e2:
+                print(f"[FFMPEG CAMERA] Hardware open failed ({e2}). Switching to Synthetic fallback.")
+                self.player = None
+                self._fallback_track = SyntheticFFmpegTrack(self.width, self.height, self.fps, name=self.name)
+
+    async def recv(self) -> av.VideoFrame:
+        if self.player and self.player.video:
+            try:
+                return await self.player.video.recv()
+            except Exception as e:
+                print(f"[FFMPEG CAMERA] {self.name} recv error: {e}")
+                if not self._fallback_track:
+                    self._fallback_track = SyntheticFFmpegTrack(self.width, self.height, self.fps, name=self.name)
+                return await self._fallback_track.recv()
+
+        if self._fallback_track:
+            return await self._fallback_track.recv()
+
+        # Last resort black frame
+        frame = av.VideoFrame(self.width, self.height, "yuv420p")
         pts, time_base = await self.next_timestamp()
-
-        frame_bgr = self.reader.get_frame()
-        if frame_bgr is None:
-            frame_bgr = np.zeros((self.height, self.width, 3), dtype=np.uint8)
-
-        video_frame = VideoFrame.from_ndarray(frame_bgr, format="bgr24")
-        video_frame.pts = pts
-        video_frame.time_base = time_base
-        return video_frame
+        frame.pts = pts
+        frame.time_base = time_base
+        return frame
 
     def stop_camera(self):
-        self.reader.stop()
+        print(f"[FFMPEG CAMERA] Releasing {self.name} resources...")
+        if self.player:
+            try:
+                if hasattr(self.player, "container") and self.player.container:
+                    self.player.container.close()
+            except Exception as e:
+                print(f"[FFMPEG CAMERA] Close error for {self.name}: {e}")
+            self.player = None
+        if self._fallback_track:
+            self._fallback_track.stop_camera()
 
-class CompositeAllCameraTrack(MediaStreamTrack):
-    kind = "video"
-
-    def __init__(self, in_source, out_source, quality: str = DEFAULT_QUALITY):
-        super().__init__()
-        prof = QUALITY_PROFILES.get(quality.lower(), QUALITY_PROFILES["720p"])
-        self.total_width = prof["width"]
-        self.total_height = prof["height"]
-        self.fps = prof["fps"]
-
-        self.half_width = self.total_width // 2
-        self.sub_height = self.total_height
-
-        self.reader_in = CameraCaptureThread(in_source, self.half_width, self.sub_height, self.fps, name="In-Camera")
-        self.reader_out = CameraCaptureThread(out_source, self.half_width, self.sub_height, self.fps, name="Out-Camera")
-
-        self._pts = 0
-        self._time_base = Fraction(1, self.fps)
-
-    async def recv(self) -> VideoFrame:
-        pts, time_base = await self.next_timestamp()
-
-        frame_in = self.reader_in.get_frame()
-        frame_out = self.reader_out.get_frame()
-
-        if frame_in is None:
-            frame_in = np.zeros((self.sub_height, self.half_width, 3), dtype=np.uint8)
-        if frame_out is None:
-            frame_out = np.zeros((self.sub_height, self.half_width, 3), dtype=np.uint8)
-
-        cv2.rectangle(frame_in, (0, 0), (self.half_width, 35), (20, 20, 20), -1)
-        cv2.putText(frame_in, "CAM 1: IN (CABIN)", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 200), 2)
-
-        cv2.rectangle(frame_out, (0, 0), (self.half_width, 35), (20, 20, 20), -1)
-        cv2.putText(frame_out, "CAM 2: OUT (ROAD)", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 200, 0), 2)
-
-        composite = np.hstack([frame_in, frame_out])
-
-        video_frame = VideoFrame.from_ndarray(composite, format="bgr24")
-        video_frame.pts = pts
-        video_frame.time_base = time_base
-        return video_frame
-
-    def stop_camera(self):
-        self.reader_in.stop()
-        self.reader_out.stop()
-
-def create_video_tracks(camera_mode: str = "in", quality: str = DEFAULT_QUALITY):
-    mode = (camera_mode or "in").lower()
-    print(f"[CAMERA FACTORY] Creating video track(s) for mode='{mode}', quality='{quality}'")
+def create_video_tracks(camera_mode: str = "all", quality: str = DEFAULT_QUALITY) -> List[MediaStreamTrack]:
+    """
+    Factory function using FFmpeg to create video tracks.
+    - 'in'  : returns [In-Camera Track]
+    - 'out' : returns [Out-Camera Track]
+    - 'all' : returns [In-Camera Track, Out-Camera Track] (Multi-stream WebRTC)
+    """
+    mode = (camera_mode or "all").lower()
+    print(f"[CAMERA FACTORY] Creating FFmpeg video track(s) for mode='{mode}', quality='{quality}'")
 
     if mode == "in":
-        return [SingleCameraTrack(source=CAMERA_IN_DEVICE, quality=quality, name="In-Camera")]
+        return [FFmpegCameraTrack(source=IN_VIDEO_DEVICE, quality=quality, name="In-Camera")]
     elif mode == "out":
-        return [SingleCameraTrack(source=CAMERA_OUT_DEVICE, quality=quality, name="Out-Camera")]
+        return [FFmpegCameraTrack(source=OUT_VIDEO_DEVICE, quality=quality, name="Out-Camera")]
     elif mode in ("all", "both"):
-        return [CompositeAllCameraTrack(in_source=CAMERA_IN_DEVICE, out_source=CAMERA_OUT_DEVICE, quality=quality)]
+        track_in = FFmpegCameraTrack(source=IN_VIDEO_DEVICE, quality=quality, name="In-Camera")
+        track_out = FFmpegCameraTrack(source=OUT_VIDEO_DEVICE, quality=quality, name="Out-Camera")
+        return [track_in, track_out]
     else:
-        print(f"[CAMERA FACTORY] Unknown mode '{mode}', defaulting to 'in'")
-        return [SingleCameraTrack(source=CAMERA_IN_DEVICE, quality=quality, name="In-Camera")]
+        print(f"[CAMERA FACTORY] Unknown mode '{mode}', defaulting to 'all'")
+        track_in = FFmpegCameraTrack(source=IN_VIDEO_DEVICE, quality=quality, name="In-Camera")
+        track_out = FFmpegCameraTrack(source=OUT_VIDEO_DEVICE, quality=quality, name="Out-Camera")
+        return [track_in, track_out]

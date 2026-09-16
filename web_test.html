@@ -3,11 +3,11 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>🎥 WebRTC Video & Audio Live Stream Test</title>
+  <title>🎥 WebRTC Video & Audio Live Stream (FFmpeg)</title>
   <style>
     * { box-sizing: border-box; }
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif; padding: 20px; background: #0f172a; color: #f8fafc; margin: 0; }
-    .container { max-width: 1200px; margin: 0 auto; }
+    .container { max-width: 1400px; margin: 0 auto; }
     header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #334155; padding-bottom: 15px; margin-bottom: 20px; }
     h1 { margin: 0; font-size: 22px; color: #38bdf8; display: flex; align-items: center; gap: 10px; }
     .status-badge { display: inline-flex; align-items: center; gap: 8px; padding: 6px 16px; border-radius: 9999px; font-size: 13px; font-weight: 600; }
@@ -16,10 +16,10 @@
     .status-badge.connected { background: #15803d; color: #bbf7d0; }
     .status-badge.error { background: #b91c1c; color: #fecaca; }
     
-    .grid-layout { display: grid; grid-template-columns: 380px 1fr; gap: 20px; }
+    .grid-layout { display: grid; grid-template-columns: 360px 1fr; gap: 20px; }
     
     .panel { background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 20px; }
-    .panel-title { font-size: 16px; font-weight: 700; color: #94a3b8; margin-top: 0; margin-bottom: 15px; text-transform: uppercase; letter-spacing: 0.5px; }
+    .panel-title { font-size: 15px; font-weight: 700; color: #94a3b8; margin-top: 0; margin-bottom: 15px; text-transform: uppercase; letter-spacing: 0.5px; }
     
     .form-group { margin-bottom: 14px; }
     label { display: block; font-size: 12px; font-weight: 600; color: #cbd5e1; margin-bottom: 5px; }
@@ -45,20 +45,30 @@
     .btn-stream:hover:not(:disabled) { background: #15803d; }
     .btn-stop { background: #dc2626; color: white; }
     .btn-stop:hover:not(:disabled) { background: #b91c1c; }
+    .btn-audio { background: #6366f1; color: white; margin-top: 10px; }
     
-    .video-container {
-      position: relative; background: #000; border-radius: 12px; overflow: hidden;
-      aspect-ratio: 16 / 9; display: flex; align-items: center; justify-content: center; border: 1px solid #334155;
+    .videos-wrapper { display: grid; grid-template-columns: 1fr; gap: 15px; }
+    .videos-wrapper.dual { grid-template-columns: 1fr 1fr; }
+    
+    .video-card {
+      background: #000; border-radius: 12px; overflow: hidden;
+      border: 1px solid #334155; position: relative; aspect-ratio: 16 / 9;
+      display: flex; align-items: center; justify-content: center;
     }
-    video { width: 100%; height: 100%; object-fit: contain; }
+    .video-card video { width: 100%; height: 100%; object-fit: contain; }
+    .video-label {
+      position: absolute; top: 10px; left: 10px; background: rgba(0,0,0,0.7);
+      padding: 4px 10px; border-radius: 6px; font-size: 12px; font-weight: bold; color: #38bdf8;
+      border: 1px solid rgba(255,255,255,0.1); z-index: 10;
+    }
     .video-placeholder {
-      position: absolute; text-align: center; color: #64748b; font-size: 16px;
-      display: flex; flex-direction: column; align-items: center; gap: 10px;
+      position: absolute; text-align: center; color: #64748b; font-size: 15px;
+      display: flex; flex-direction: column; align-items: center; gap: 8px;
     }
     
     pre#log {
       background: #020617; color: #4ade80; padding: 14px; border-radius: 8px;
-      height: 240px; overflow-y: auto; font-family: "SFMono-Regular", Consolas, Menlo, monospace;
+      height: 200px; overflow-y: auto; font-family: "SFMono-Regular", Consolas, Menlo, monospace;
       font-size: 12px; line-height: 1.5; margin-top: 15px; border: 1px solid #1e293b;
     }
   </style>
@@ -66,7 +76,7 @@
 <body>
   <div class="container">
     <header>
-      <h1>📹 WebRTC Live Stream Dashboard</h1>
+      <h1>📹 WebRTC Live Stream Dashboard (FFmpeg Engine)</h1>
       <span id="statusBadge" class="status-badge idle">● Ulanmagan</span>
     </header>
 
@@ -96,17 +106,17 @@
         <div class="form-group">
           <label>Kamera Rejimi</label>
           <select id="cameraMode">
+            <option value="all" selected>Ikkala Kamera (ALL - Dual Stream)</option>
             <option value="in">Ichki Kamera (IN - Salon)</option>
             <option value="out">Tashqi Kamera (OUT - Yo'l)</option>
-            <option value="all" selected>Ikkala Kamera (ALL - Yonma-yon)</option>
           </select>
         </div>
 
         <div class="form-group">
           <label>Video Sifati (Kachestva)</label>
           <select id="quality">
-            <option value="480p">480p (SD 640x480)</option>
             <option value="720p" selected>720p (HD 1280x720)</option>
+            <option value="480p">480p (SD 640x480)</option>
             <option value="1080p">1080p (FullHD 1920x1080)</option>
             <option value="2k">2K (QHD 2560x1440)</option>
           </select>
@@ -121,19 +131,37 @@
           <button id="btnConnect" class="btn-connect">1. WS & STOMP Ulanish</button>
           <button id="btnStart" class="btn-stream" disabled>2. 🎥 START LIVE STREAM</button>
           <button id="btnStop" class="btn-stop" disabled>3. ⏹️ STOP STREAM</button>
+          <button id="btnUnmute" class="btn-audio" type="button">🔊 Ovozni Yoqish (Unmute Audio)</button>
         </div>
       </div>
 
       <!-- Live Video View & Logs -->
       <div style="display: flex; flex-direction: column; gap: 20px;">
-        <div class="panel" style="padding: 10px;">
-          <div class="video-container">
-            <video id="remoteVideo" autoplay playsinline controls></video>
-            <div id="videoPlaceholder" class="video-placeholder">
-              <svg width="48" height="48" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M4 6h9a2 2 0 012 2v8a2 2 0 01-2 2H4a2 2 0 01-2-2V8a2 2 0 012-2z"></path></svg>
-              <span>Jonli video stream kutilmoqda...</span>
+        <div class="panel" style="padding: 15px;">
+          <div id="videoGrid" class="videos-wrapper dual">
+            <!-- Camera 1 -->
+            <div class="video-card" id="cardCam1">
+              <span class="video-label" id="lblCam1">CAM 1 (ICHKI / IN)</span>
+              <video id="videoPlayer1" autoplay playsinline muted controls></video>
+              <div id="phCam1" class="video-placeholder">
+                <svg width="40" height="40" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M4 6h9a2 2 0 012 2v8a2 2 0 01-2 2H4a2 2 0 01-2-2V8a2 2 0 012-2z"></path></svg>
+                <span>CAM 1 Kutilmoqda...</span>
+              </div>
+            </div>
+
+            <!-- Camera 2 -->
+            <div class="video-card" id="cardCam2">
+              <span class="video-label" id="lblCam2">CAM 2 (TASHQI / OUT)</span>
+              <video id="videoPlayer2" autoplay playsinline muted controls></video>
+              <div id="phCam2" class="video-placeholder">
+                <svg width="40" height="40" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M4 6h9a2 2 0 012 2v8a2 2 0 01-2 2H4a2 2 0 01-2-2V8a2 2 0 012-2z"></path></svg>
+                <span>CAM 2 Kutilmoqda...</span>
+              </div>
             </div>
           </div>
+
+          <!-- Hidden Audio Player for WebRTC audio -->
+          <audio id="remoteAudio" autoplay playsinline></audio>
         </div>
 
         <div class="panel" style="flex: 1;">
@@ -156,14 +184,22 @@
     let pc = null;
     let pendingIceFromServer = [];
     let remoteDescriptionSet = false;
+    let videoTracksCount = 0;
 
     const elLog = document.getElementById("log");
     const elStatus = document.getElementById("statusBadge");
-    const elVideo = document.getElementById("remoteVideo");
-    const elPlaceholder = document.getElementById("videoPlaceholder");
+    const vPlayer1 = document.getElementById("videoPlayer1");
+    const vPlayer2 = document.getElementById("videoPlayer2");
+    const phCam1 = document.getElementById("phCam1");
+    const phCam2 = document.getElementById("phCam2");
+    const cardCam2 = document.getElementById("cardCam2");
+    const videoGrid = document.getElementById("videoGrid");
+    const elAudio = document.getElementById("remoteAudio");
+
     const btnConnect = document.getElementById("btnConnect");
     const btnStart = document.getElementById("btnStart");
     const btnStop = document.getElementById("btnStop");
+    const btnUnmute = document.getElementById("btnUnmute");
 
     function log(...args) {
       const ts = new Date().toLocaleTimeString();
@@ -236,11 +272,9 @@
       if (!rawToken) { alert("Iltimos, Bearer Token kiriting!"); return; }
       if (!serialNumber) { alert("Serial Number kiriting!"); return; }
 
-      // Clean up token formatting (strip accidental double 'Bearer ' or quotes)
       rawToken = rawToken.replace(/^Bearer\s+/i, '').replace(/['"]/g, '').trim();
       const authHeader = `Bearer ${rawToken}`;
 
-      // Inspect JWT Expiry
       try {
         const parts = rawToken.split('.');
         if (parts.length === 3) {
@@ -249,10 +283,8 @@
             const expDate = new Date(payload.exp * 1000);
             const now = new Date();
             if (now >= expDate) {
-              log(`❌ XATOLIK: Token muddati o'tgan (Expired)!`);
-              log(`   Token tugash vaqti : ${expDate.toLocaleString()}`);
-              log(`   Hozirgi vaqt       : ${now.toLocaleString()}`);
-              alert(`❌ Kiritilgan Token muddati tugagan (Expired: ${expDate.toLocaleTimeString()})!\nIltimos, yangi token oling.`);
+              log(`❌ XATOLIK: Token muddati o'tgan (Expired: ${expDate.toLocaleString()})!`);
+              alert(`❌ Kiritilgan Token muddati tugagan (Expired)!\nIltimos, yangi token oling.`);
               return;
             } else {
               log(`ℹ️ Token yaroqli ✅ (Tugash vaqti: ${expDate.toLocaleTimeString()})`);
@@ -304,7 +336,6 @@
               btnStart.disabled = false;
               btnConnect.disabled = true;
 
-              // Subscribe to all possible signal topics for this web session
               const t1 = `${SIGNAL_TOPIC_BASE}/admin/${webSid}`;
               const t2 = `${SIGNAL_TOPIC_BASE}/${serialNumber}/${webSid}`;
               const t3 = `/topic/signal/admin/${webSid}`;
@@ -315,7 +346,7 @@
               sockjsSend(buildFrame("SUBSCRIBE", { id: "sub-v3", destination: t3, ack: "auto" }));
               sockjsSend(buildFrame("SUBSCRIBE", { id: "sub-v4", destination: t4, ack: "auto" }));
 
-              log(`SUBSCRIBED to topics: ${t1}, ${t2}, ${t3}`);
+              log(`SUBSCRIBED to signal topics ✅`);
               continue;
             }
 
@@ -326,7 +357,6 @@
             }
 
             if (cmd === "MESSAGE") {
-              const dest = headers.destination || "";
               try {
                 const raw = JSON.parse(body);
                 const payload = (raw && typeof raw === "object" && "data" in raw) ? raw.data : raw;
@@ -362,15 +392,8 @@
         ...signalPayload
       };
 
-      // 1. Send to video stream topic
-      const topicVideo = `${SIGNAL_TOPIC_BASE}/${serialNumber}/${miniSid}`;
-      stompSendJson(topicVideo, envelope);
-
-      // 2. Send to general signal topic
-      const topicSignal = `/topic/signal/${serialNumber}/${miniSid}`;
-      stompSendJson(topicSignal, envelope);
-
-      // 3. Send to app controller destination
+      stompSendJson(`${SIGNAL_TOPIC_BASE}/${serialNumber}/${miniSid}`, envelope);
+      stompSendJson(`/topic/signal/${serialNumber}/${miniSid}`, envelope);
       stompSendJson(SEND_DEST, envelope);
     }
 
@@ -385,19 +408,36 @@
       });
       remoteDescriptionSet = false;
       pendingIceFromServer = [];
+      videoTracksCount = 0;
 
       pc.ontrack = (event) => {
-        log(`📡 Remote Track qabul qilindi: kind=${event.track.kind}`);
-        if (event.streams && event.streams[0]) {
-          elVideo.srcObject = event.streams[0];
-        } else {
-          if (!elVideo.srcObject) {
-            elVideo.srcObject = new MediaStream();
+        log(`📡 Remote Track qabul qilindi: kind=${event.track.kind}, id=${event.track.id}`);
+
+        if (event.track.kind === "video") {
+          videoTracksCount++;
+          const stream = event.streams && event.streams[0] ? event.streams[0] : new MediaStream([event.track]);
+
+          if (videoTracksCount === 1) {
+            vPlayer1.srcObject = stream;
+            vPlayer1.muted = true;
+            vPlayer1.play().catch(e => log("Video 1 play error:", e));
+            phCam1.style.display = "none";
+            log("🎥 Video Track 1 -> CAM 1 ga ulandi!");
+          } else if (videoTracksCount >= 2) {
+            vPlayer2.srcObject = stream;
+            vPlayer2.muted = true;
+            vPlayer2.play().catch(e => log("Video 2 play error:", e));
+            phCam2.style.display = "none";
+            cardCam2.style.display = "flex";
+            videoGrid.className = "videos-wrapper dual";
+            log("🎥 Video Track 2 -> CAM 2 ga ulandi!");
           }
-          elVideo.srcObject.addTrack(event.track);
+        } else if (event.track.kind === "audio") {
+          const stream = event.streams && event.streams[0] ? event.streams[0] : new MediaStream([event.track]);
+          elAudio.srcObject = stream;
+          elAudio.play().catch(e => log("Audio play error:", e));
+          log("🔊 Audio oqimi dinamikka ulandi!");
         }
-        elPlaceholder.style.display = "none";
-        log(`🎥 ${event.track.kind.toUpperCase()} oqimi playerga ulandi!`);
       };
 
       pc.onicecandidate = (event) => {
@@ -446,13 +486,11 @@
           remoteDescriptionSet = true;
           log("Remote OFFER o'rnatildi ✅");
 
-          // Process queued ICE candidates
           for (const cand of pendingIceFromServer) {
             await pc.addIceCandidate(cand);
           }
           pendingIceFromServer = [];
 
-          // Create and send SDP ANSWER
           const answer = await pc.createAnswer();
           await pc.setLocalDescription(answer);
           log("Local SDP ANSWER yaratildi ✅");
@@ -490,7 +528,7 @@
 
         if (!remoteDescriptionSet || !pc) {
           pendingIceFromServer.push(candidate);
-          log("Server ICE navbatga qo'yildi (ANSWER kutilmoqda)");
+          log("Server ICE navbatga qo'yildi");
         } else {
           try {
             await pc.addIceCandidate(candidate);
@@ -513,6 +551,20 @@
       if (!miniSid) {
         alert("Iltimos, MiniPC Session ID ni kiriting (Python logidan oling)!");
         return;
+      }
+
+      // Reset players UI
+      phCam1.style.display = "flex";
+      phCam2.style.display = "flex";
+      if (cameraMode === "in") {
+        cardCam2.style.display = "none";
+        videoGrid.className = "videos-wrapper";
+      } else if (cameraMode === "out") {
+        cardCam2.style.display = "none";
+        videoGrid.className = "videos-wrapper";
+      } else {
+        cardCam2.style.display = "flex";
+        videoGrid.className = "videos-wrapper dual";
       }
 
       log(`START_STREAM so'rovi yuborilmoqda: mode=${cameraMode}, quality=${quality}, audio=${audioEnabled}`);
@@ -553,14 +605,39 @@
         pc.close();
         pc = null;
       }
-      if (elVideo.srcObject) {
-        elVideo.srcObject.getTracks().forEach(t => t.stop());
-        elVideo.srcObject = null;
+      if (vPlayer1.srcObject) {
+        vPlayer1.srcObject.getTracks().forEach(t => t.stop());
+        vPlayer1.srcObject = null;
       }
-      elPlaceholder.style.display = "flex";
+      if (vPlayer2.srcObject) {
+        vPlayer2.srcObject.getTracks().forEach(t => t.stop());
+        vPlayer2.srcObject = null;
+      }
+      if (elAudio.srcObject) {
+        elAudio.srcObject.getTracks().forEach(t => t.stop());
+        elAudio.srcObject = null;
+      }
+      phCam1.style.display = "flex";
+      phCam2.style.display = "flex";
       log("Stream to'xtatildi ⏹️");
       setStatus("To'xtatildi", "idle");
       btnStop.disabled = true;
+    }
+
+    function toggleUnmute() {
+      if (elAudio.muted) {
+        elAudio.muted = false;
+        vPlayer1.muted = false;
+        vPlayer2.muted = false;
+        btnUnmute.textContent = "🔇 Ovozni O'chirish (Mute Audio)";
+        log("Ovoz yoqildi (Unmuted) 🔊");
+      } else {
+        elAudio.muted = true;
+        vPlayer1.muted = true;
+        vPlayer2.muted = true;
+        btnUnmute.textContent = "🔊 Ovozni Yoqish (Unmute Audio)";
+        log("Ovoz o'chirildi (Muted) 🔇");
+      }
     }
 
     async function fetchLocalInfo() {
@@ -590,6 +667,7 @@
     btnConnect.onclick = connectStomp;
     btnStart.onclick = startStream;
     btnStop.onclick = stopStream;
+    btnUnmute.onclick = toggleUnmute;
   </script>
 </body>
 </html>
