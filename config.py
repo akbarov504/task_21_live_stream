@@ -20,10 +20,10 @@ if DEFAULT_QUALITY not in QUALITY_PROFILES:
     DEFAULT_QUALITY = "720p"
 
 IN_VIDEO_DEVICE = os.getenv("IN_VIDEO_DEVICE", "/dev/v4l/by-path/platform-xhci-hcd.0.auto-usb-0:1.4.2:1.0-video-index0")
-IN_AUDIO_DEVICE = os.getenv("IN_AUDIO_DEVICE", "hw:4,0")
+IN_AUDIO_DEVICE = os.getenv("IN_AUDIO_DEVICE", "hw:3,0")
 
 OUT_VIDEO_DEVICE = os.getenv("OUT_VIDEO_DEVICE", "/dev/v4l/by-path/platform-xhci-hcd.0.auto-usb-0:1.3:1.0-video-index0")
-OUT_AUDIO_DEVICE = os.getenv("OUT_AUDIO_DEVICE", "hw:3,0")
+OUT_AUDIO_DEVICE = os.getenv("OUT_AUDIO_DEVICE", "hw:4,0")
 
 CAMERA_IN_DEVICE = IN_VIDEO_DEVICE
 CAMERA_OUT_DEVICE = OUT_VIDEO_DEVICE
