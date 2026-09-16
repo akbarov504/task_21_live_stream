@@ -304,10 +304,18 @@
               btnStart.disabled = false;
               btnConnect.disabled = true;
 
-              // Subscribe to our web signal topic
-              const webSigTopic = `${SIGNAL_TOPIC_BASE}/admin/${webSid}`;
-              sockjsSend(buildFrame("SUBSCRIBE", { id: "sub-web-sig", destination: webSigTopic, ack: "auto" }));
-              log("SUBSCRIBED to:", webSigTopic);
+              // Subscribe to all possible signal topics for this web session
+              const t1 = `${SIGNAL_TOPIC_BASE}/admin/${webSid}`;
+              const t2 = `${SIGNAL_TOPIC_BASE}/${serialNumber}/${webSid}`;
+              const t3 = `/topic/signal/admin/${webSid}`;
+              const t4 = `/topic/signal/${serialNumber}/${webSid}`;
+
+              sockjsSend(buildFrame("SUBSCRIBE", { id: "sub-v1", destination: t1, ack: "auto" }));
+              sockjsSend(buildFrame("SUBSCRIBE", { id: "sub-v2", destination: t2, ack: "auto" }));
+              sockjsSend(buildFrame("SUBSCRIBE", { id: "sub-v3", destination: t3, ack: "auto" }));
+              sockjsSend(buildFrame("SUBSCRIBE", { id: "sub-v4", destination: t4, ack: "auto" }));
+
+              log(`SUBSCRIBED to topics: ${t1}, ${t2}, ${t3}`);
               continue;
             }
 
@@ -345,6 +353,27 @@
       };
     }
 
+    function sendSignalToMiniPc(signalPayload) {
+      const serialNumber = document.getElementById("serialNumber").value.trim();
+      const miniSid = document.getElementById("miniSid").value.trim();
+
+      const envelope = {
+        data: signalPayload,
+        ...signalPayload
+      };
+
+      // 1. Send to video stream topic
+      const topicVideo = `${SIGNAL_TOPIC_BASE}/${serialNumber}/${miniSid}`;
+      stompSendJson(topicVideo, envelope);
+
+      // 2. Send to general signal topic
+      const topicSignal = `/topic/signal/${serialNumber}/${miniSid}`;
+      stompSendJson(topicSignal, envelope);
+
+      // 3. Send to app controller destination
+      stompSendJson(SEND_DEST, envelope);
+    }
+
     // ── WebRTC Setup ──────────────────────────────────────────
     function createPeerConnection() {
       if (pc) {
@@ -361,9 +390,14 @@
         log(`📡 Remote Track qabul qilindi: kind=${event.track.kind}`);
         if (event.streams && event.streams[0]) {
           elVideo.srcObject = event.streams[0];
-          elPlaceholder.style.display = "none";
-          log("🎥 Video oqimi playerga ulandi!");
+        } else {
+          if (!elVideo.srcObject) {
+            elVideo.srcObject = new MediaStream();
+          }
+          elVideo.srcObject.addTrack(event.track);
         }
+        elPlaceholder.style.display = "none";
+        log(`🎥 ${event.track.kind.toUpperCase()} oqimi playerga ulandi!`);
       };
 
       pc.onicecandidate = (event) => {
@@ -384,7 +418,7 @@
             sdpMLineIndex: event.candidate.sdpMLineIndex,
           }
         };
-        stompSendJson(SEND_DEST, icePayload);
+        sendSignalToMiniPc(icePayload);
         log("ICE_TO_MINIPC yuborildi 📡");
       };
 
@@ -436,8 +470,7 @@
             toSessionId: miniSid,
           };
 
-          const dest = `${SIGNAL_TOPIC_BASE}/${serialNumber}/${miniSid}`;
-          stompSendJson(dest, answerPayload);
+          sendSignalToMiniPc(answerPayload);
           log("SDP ANSWER MiniPC ga yuborildi 🚀");
         } catch (e) {
           log("OFFER/ANSWER xatosi:", e);
@@ -496,8 +529,7 @@
         audio: audioEnabled,
       };
 
-      const dest = `${SIGNAL_TOPIC_BASE}/${serialNumber}/${miniSid}`;
-      stompSendJson(dest, startPayload);
+      sendSignalToMiniPc(startPayload);
       setStatus("Stream so'ralmoqda...", "connecting");
       btnStop.disabled = false;
     }
@@ -515,8 +547,7 @@
         toSessionId: miniSid,
       };
 
-      const dest = `${SIGNAL_TOPIC_BASE}/${serialNumber}/${miniSid}`;
-      stompSendJson(dest, stopPayload);
+      sendSignalToMiniPc(stopPayload);
 
       if (pc) {
         pc.close();
