@@ -1,6 +1,7 @@
 import asyncio
 import os
 import time
+import gc
 import platform
 from fractions import Fraction
 from typing import Optional, List, Dict, Any
@@ -18,12 +19,11 @@ from config import (
 class SyntheticFFmpegTrack(MediaStreamTrack):
     """
     Lightweight synthetic video track using PyAV.
-    Used when physical V4L2 camera is unavailable (e.g. testing / missing hardware).
-    Consumes practically 0% CPU.
+    Used when physical V4L2 camera is unavailable.
     """
     kind = "video"
 
-    def __init__(self, width: int = 1280, height: int = 720, fps: int = 30, name: str = "Camera"):
+    def __init__(self, width: int = 1280, height: int = 720, fps: int = 25, name: str = "Camera"):
         super().__init__()
         self.width = width
         self.height = height
@@ -36,15 +36,11 @@ class SyntheticFFmpegTrack(MediaStreamTrack):
 
     async def recv(self) -> av.VideoFrame:
         pts, time_base = await self.next_timestamp()
-
-        # Create clean YUV420P frame (native WebRTC format, no conversions needed)
         frame = av.VideoFrame(self.width, self.height, "yuv420p")
 
-        # Background color modulation
         t = time.time() - self._start_time
         y_val = int((t * 20) % 200) + 20
 
-        # Fill planes with solid color pattern
         for p in frame.planes:
             p.update(bytes([y_val] * p.buffer_size))
 
@@ -57,24 +53,30 @@ class SyntheticFFmpegTrack(MediaStreamTrack):
 
 class FFmpegCameraTrack(MediaStreamTrack):
     """
-    High-performance, low-CPU camera track backed by native FFmpeg (libavdevice / V4L2).
-    Streams MJPEG directly from hardware with smart resolution ladder and USB bandwidth auto-recovery.
+    High-performance camera track backed by native FFmpeg (libavdevice / V4L2).
+    Includes smart USB bandwidth handling and clean device releasing.
     """
     kind = "video"
 
-    def __init__(self, source: str, quality: str = DEFAULT_QUALITY, name: str = "Camera"):
+    def __init__(self, source: str, quality: str = DEFAULT_QUALITY, name: str = "Camera", is_dual: bool = False):
         super().__init__()
         prof = QUALITY_PROFILES.get(quality.lower(), QUALITY_PROFILES["720p"])
         self.target_width = prof["width"]
         self.target_height = prof["height"]
         self.target_fps = prof["fps"]
-        self.width = self.target_width
-        self.height = self.target_height
-        self.fps = self.target_fps
+        self.is_dual = is_dual
         self.name = name
         self.source = str(source)
         self.player: Optional[MediaPlayer] = None
         self._fallback_track: Optional[MediaStreamTrack] = None
+
+        # In dual camera mode, use optimized 20-25 fps to prevent USB bus saturation
+        if self.is_dual and self.target_fps > 20:
+            self.target_fps = 20
+
+        self.width = self.target_width
+        self.height = self.target_height
+        self.fps = self.target_fps
 
         self._init_ffmpeg_player()
 
@@ -82,20 +84,30 @@ class FFmpegCameraTrack(MediaStreamTrack):
         is_linux = platform.system() == "Linux"
         fmt = "v4l2" if is_linux else None
 
-        # Ladder of resolutions to try if USB bus bandwidth (ENOSPC / Errno 28) is saturated
-        resolutions_to_try = [
-            (self.target_width, self.target_height, self.target_fps),
-            (1920, 1080, 30),
-            (1280, 720, 30),
-            (640, 480, 25),
-        ]
+        # Ladder of (width, height, fps) configurations to try
+        if self.is_dual:
+            resolutions_to_try = [
+                (self.target_width, self.target_height, self.target_fps),
+                (1280, 720, 20),
+                (1280, 720, 15),
+                (640, 480, 25),
+                (1920, 1080, 15),
+            ]
+        else:
+            resolutions_to_try = [
+                (self.target_width, self.target_height, self.target_fps),
+                (1920, 1080, 30),
+                (1280, 720, 30),
+                (640, 480, 25),
+            ]
 
         seen = set()
         unique_resolutions = []
         for w, h, fps in resolutions_to_try:
-            if (w, h) not in seen:
-                seen.add((w, h))
-                unique_resolutions.append((w, h, fps))
+            key = (w, h, fps)
+            if key not in seen:
+                seen.add(key)
+                unique_resolutions.append(key)
 
         opened = False
         for w, h, fps in unique_resolutions:
@@ -118,26 +130,23 @@ class FFmpegCameraTrack(MediaStreamTrack):
                     raise RuntimeError(f"Device {self.source} not accessible on this platform")
             except Exception as e:
                 err_str = str(e)
-                print(f"[FFMPEG CAMERA] {self.name} failed at {w}x{h} ({err_str})")
-                if "No space left on device" in err_str or "Device or resource busy" in err_str:
-                    print(f"[FFMPEG CAMERA] USB bandwidth saturation detected! Stepping down resolution...")
-                    time.sleep(0.3)
-                    continue
-                # Try raw V4L2 without mjpeg as an intermediate step for this resolution
-                try:
-                    options_raw = {"video_size": f"{w}x{h}", "framerate": str(fps)}
-                    self.player = MediaPlayer(self.source, format=fmt, options=options_raw)
-                    self.width = w
-                    self.height = h
-                    self.fps = fps
-                    opened = True
-                    print(f"[FFMPEG CAMERA] {self.name} opened with raw V4L2 {w}x{h}@{fps}fps ✅")
-                    break
-                except Exception:
-                    continue
+                print(f"[FFMPEG CAMERA] {self.name} attempt failed at {w}x{h}@{fps}fps: {err_str}")
+
+                # Ensure previous container / file descriptor is completely closed
+                if self.player:
+                    try:
+                        if hasattr(self.player, "container") and self.player.container:
+                            self.player.container.close()
+                    except Exception:
+                        pass
+                    self.player = None
+
+                gc.collect()
+                time.sleep(0.5)  # Allow V4L2 kernel driver to release device endpoint
+                continue
 
         if not opened:
-            print(f"[FFMPEG CAMERA] Could not open physical device {self.source}. Using synthetic fallback.")
+            print(f"[FFMPEG CAMERA] Physical device {self.source} unavailable. Using synthetic fallback.")
             self.player = None
             self._fallback_track = SyntheticFFmpegTrack(self.target_width, self.target_height, self.target_fps, name=self.name)
 
@@ -171,31 +180,30 @@ class FFmpegCameraTrack(MediaStreamTrack):
             self.player = None
         if self._fallback_track:
             self._fallback_track.stop_camera()
+        gc.collect()
 
 def create_video_tracks(camera_mode: str = "all", quality: str = DEFAULT_QUALITY) -> List[MediaStreamTrack]:
     """
     Factory function using FFmpeg to create video tracks.
     - 'in'  : returns [In-Camera Track]
     - 'out' : returns [Out-Camera Track]
-    - 'all' : returns [In-Camera Track, Out-Camera Track] (Multi-stream WebRTC)
+    - 'all' : returns [In-Camera Track, Out-Camera Track] (Dual-stream WebRTC)
     """
     mode = (camera_mode or "all").lower()
     print(f"[CAMERA FACTORY] Creating FFmpeg video track(s) for mode='{mode}', quality='{quality}'")
 
     if mode == "in":
-        return [FFmpegCameraTrack(source=IN_VIDEO_DEVICE, quality=quality, name="In-Camera")]
+        return [FFmpegCameraTrack(source=IN_VIDEO_DEVICE, quality=quality, name="In-Camera", is_dual=False)]
     elif mode == "out":
-        return [FFmpegCameraTrack(source=OUT_VIDEO_DEVICE, quality=quality, name="Out-Camera")]
+        return [FFmpegCameraTrack(source=OUT_VIDEO_DEVICE, quality=quality, name="Out-Camera", is_dual=False)]
     elif mode in ("all", "both"):
-        # In dual camera mode, open In-Camera first then Out-Camera
-        track_in = FFmpegCameraTrack(source=IN_VIDEO_DEVICE, quality=quality, name="In-Camera")
-        # Short 200ms delay to allow USB host controller bandwidth allocation to settle
-        time.sleep(0.2)
-        track_out = FFmpegCameraTrack(source=OUT_VIDEO_DEVICE, quality=quality, name="Out-Camera")
+        track_in = FFmpegCameraTrack(source=IN_VIDEO_DEVICE, quality=quality, name="In-Camera", is_dual=True)
+        time.sleep(0.5)  # Allow USB host controller bandwidth allocation to settle
+        track_out = FFmpegCameraTrack(source=OUT_VIDEO_DEVICE, quality=quality, name="Out-Camera", is_dual=True)
         return [track_in, track_out]
     else:
         print(f"[CAMERA FACTORY] Unknown mode '{mode}', defaulting to 'all'")
-        track_in = FFmpegCameraTrack(source=IN_VIDEO_DEVICE, quality=quality, name="In-Camera")
-        time.sleep(0.2)
-        track_out = FFmpegCameraTrack(source=OUT_VIDEO_DEVICE, quality=quality, name="Out-Camera")
+        track_in = FFmpegCameraTrack(source=IN_VIDEO_DEVICE, quality=quality, name="In-Camera", is_dual=True)
+        time.sleep(0.5)
+        track_out = FFmpegCameraTrack(source=OUT_VIDEO_DEVICE, quality=quality, name="Out-Camera", is_dual=True)
         return [track_in, track_out]

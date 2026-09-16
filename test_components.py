@@ -6,15 +6,19 @@ from camera_task import create_video_tracks, FFmpegCameraTrack, SyntheticFFmpegT
 
 class TestLiveStreamComponents(unittest.TestCase):
     def test_iso_expiry_parsing(self):
-        iso_str = "2026-09-16T13:02:59.93889487"
+        iso_str = "2030-01-01T00:00:00.000000"
         ts = parse_iso_expiry(iso_str)
         self.assertGreater(ts, 0)
 
     @patch("requests.get")
     def test_token_caching(self, mock_get):
+        import auth_api
+        auth_api._cached_token = None
+        auth_api._token_expires_at = 0
+
         mock_resp = MagicMock()
         mock_resp.json.return_value = {
-            "expires_at": "2026-09-16T13:02:59.93889487",
+            "expires_at": "2030-01-01T00:00:00.000000",
             "token": "test_jwt_token_123"
         }
         mock_resp.raise_for_status.return_value = None
