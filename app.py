@@ -48,13 +48,9 @@ class LiveStreamApp:
         to_sid = payload.get("toSessionId") or ""
         sig_type = payload.get("type")
 
-        # 1. Prepare data envelope
         wrapped_body = json.dumps({"data": payload}, ensure_ascii=False)
-
-        # 2. Send to backend controller destination
         self.client.send(SEND_DEST, body=wrapped_body, content_type="application/json")
 
-        # 3. Also send directly to client topic destinations (guarantees delivery if relay controller doesn't forward)
         if to_sid:
             t1 = f"{SIGNAL_TOPIC_BASE}/{to_user}/{to_sid}"
             t2 = f"{SIGNAL_TOPIC_BASE}/{self.serial_number}/{to_sid}"
