@@ -6,8 +6,11 @@ import platform
 from fractions import Fraction
 from typing import Optional, List, Dict, Any
 import av
+import numpy as np
 from aiortc import MediaStreamTrack
 from aiortc.contrib.media import MediaPlayer
+
+RECV_TIMEOUT = 3.0
 
 from config import (
     QUALITY_PROFILES,
@@ -33,13 +36,9 @@ class SyntheticFFmpegTrack(MediaStreamTrack):
     async def recv(self) -> av.VideoFrame:
         pts, time_base = await self.next_timestamp()
         frame = av.VideoFrame(self.width, self.height, "yuv420p")
-
-        t = time.time() - self._start_time
-        y_val = int((t * 20) % 200) + 20
-
-        for p in frame.planes:
-            p.update(bytes([y_val] * p.buffer_size))
-
+        frame.planes[0].update(bytes([16] * frame.planes[0].buffer_size))   # Y
+        frame.planes[1].update(bytes([128] * frame.planes[1].buffer_size))  # Cb
+        frame.planes[2].update(bytes([128] * frame.planes[2].buffer_size))  # Cr
         frame.pts = pts
         frame.time_base = time_base
         return frame
@@ -61,6 +60,7 @@ class FFmpegCameraTrack(MediaStreamTrack):
         self.source = str(source)
         self.player: Optional[MediaPlayer] = None
         self._fallback_track: Optional[MediaStreamTrack] = None
+        self._consecutive_errors: int = 0
 
         self.width = self.target_width
         self.height = self.target_height
@@ -151,9 +151,23 @@ class FFmpegCameraTrack(MediaStreamTrack):
     async def recv(self) -> av.VideoFrame:
         if self.player and self.player.video:
             try:
-                return await self.player.video.recv()
+                frame = await asyncio.wait_for(
+                    self.player.video.recv(),
+                    timeout=RECV_TIMEOUT,
+                )
+                self._consecutive_errors = 0
+                return frame
+            except asyncio.TimeoutError:
+                self._consecutive_errors = getattr(self, "_consecutive_errors", 0) + 1
+                if self._consecutive_errors == 1:
+                    print(f"[FFMPEG CAMERA] {self.name} recv() timeout ({RECV_TIMEOUT}s) — synthetic frame qaytarilmoqda...")
+                if not self._fallback_track:
+                    self._fallback_track = SyntheticFFmpegTrack(self.width, self.height, self.fps, name=self.name)
+                return await self._fallback_track.recv()
             except Exception as e:
-                print(f"[FFMPEG CAMERA] {self.name} recv error: {e}")
+                self._consecutive_errors = getattr(self, "_consecutive_errors", 0) + 1
+                if self._consecutive_errors == 1:
+                    print(f"[FFMPEG CAMERA] {self.name} recv error: {e} — synthetic frame qaytarilmoqda...")
                 if not self._fallback_track:
                     self._fallback_track = SyntheticFFmpegTrack(self.width, self.height, self.fps, name=self.name)
                 return await self._fallback_track.recv()
@@ -163,6 +177,9 @@ class FFmpegCameraTrack(MediaStreamTrack):
 
         frame = av.VideoFrame(self.width, self.height, "yuv420p")
         pts, time_base = await self.next_timestamp()
+        frame.planes[0].update(bytes([16] * frame.planes[0].buffer_size))
+        frame.planes[1].update(bytes([128] * frame.planes[1].buffer_size))
+        frame.planes[2].update(bytes([128] * frame.planes[2].buffer_size))
         frame.pts = pts
         frame.time_base = time_base
         return frame
