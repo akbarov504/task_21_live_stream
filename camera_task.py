@@ -190,18 +190,18 @@ class FFmpegCameraTrack(MediaStreamTrack):
             try:
                 if self.player.video:
                     self.player.video.stop()
-            except Exception:
-                pass
-            try:
-                if hasattr(self.player, "container") and self.player.container:
-                    self.player.container.close()
             except Exception as e:
-                print(f"[FFMPEG CAMERA] Close error for {self.name}: {e}")
+                print(f"[FFMPEG CAMERA] video.stop() error for {self.name}: {e}")
+            try:
+                if self.player.audio:
+                    self.player.audio.stop()
+            except Exception as e:
+                print(f"[FFMPEG CAMERA] audio.stop() error for {self.name}: {e}")
             self.player = None
         if self._fallback_track:
             self._fallback_track.stop_camera()
         gc.collect()
-        time.sleep(1)
+        time.sleep(0.5)
 
 def create_video_tracks(camera_mode: str = "all", quality: str = DEFAULT_QUALITY) -> List[MediaStreamTrack]:
     mode = (camera_mode or "all").lower()
