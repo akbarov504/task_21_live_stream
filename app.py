@@ -49,7 +49,12 @@ class LiveStreamApp:
         sig_type = payload.get("type")
 
         wrapped_body = json.dumps({"data": payload}, ensure_ascii=False)
-        self.client.send(SEND_DEST, body=wrapped_body, content_type="application/json")
+
+        if to_sid:
+            dest = f"{SIGNAL_TOPIC_BASE}/{self.serial_number}/{to_sid}"
+            self.client.send(dest, body=wrapped_body, content_type="application/json")
+        else:
+            print(f"[SIGNAL OUT] Warning: no toSessionId in payload, cannot route {sig_type}")
 
         print(f"[SIGNAL OUT] Type: {sig_type} -> Sent to {to_sid} (user: {to_user}) via STOMP 📡")
 
