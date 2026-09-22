@@ -11,6 +11,7 @@ from aiortc import MediaStreamTrack
 from aiortc.contrib.media import MediaPlayer
 
 RECV_TIMEOUT = 3.0
+DEVICE_RELEASE_COOLDOWN = 1.5
 
 from config import (
     QUALITY_PROFILES,
@@ -68,6 +69,26 @@ class FFmpegCameraTrack(MediaStreamTrack):
 
         self._init_ffmpeg_player()
 
+    def _close_player_safely(self):
+        if not self.player:
+            return
+        try:
+            if self.player.video:
+                self.player.video.stop()
+        except Exception:
+            pass
+        try:
+            if self.player.audio:
+                self.player.audio.stop()
+        except Exception:
+            pass
+        try:
+            if hasattr(self.player, "container") and self.player.container:
+                self.player.container.close()
+        except Exception:
+            pass
+        self.player = None
+
     def _init_ffmpeg_player(self):
         is_linux = platform.system() == "Linux"
         fmt = "v4l2" if is_linux else None
@@ -89,6 +110,8 @@ class FFmpegCameraTrack(MediaStreamTrack):
 
         opened = False
         for w, h, fps in unique_resolutions:
+            self._close_player_safely()
+
             print(f"[FFMPEG CAMERA] Opening {self.name} via V4L2 ({w}x{h}@{fps}fps, device={self.source})...")
             try:
                 if is_linux and (os.path.exists(self.source) or self.source.startswith("/dev/")):
@@ -106,6 +129,7 @@ class FFmpegCameraTrack(MediaStreamTrack):
                 else:
                     raise RuntimeError(f"Device {self.source} not accessible on this platform")
             except Exception as e1:
+                self._close_player_safely()
                 try:
                     options_mjpeg = {
                         "video_size": f"{w}x{h}",
@@ -122,26 +146,21 @@ class FFmpegCameraTrack(MediaStreamTrack):
                 except Exception as e2:
                     print(f"[FFMPEG CAMERA] {self.name} failed at {w}x{h}@{fps}fps: {e1} / {e2}")
 
-                if self.player:
-                    try:
-                        if hasattr(self.player, "container") and self.player.container:
-                            self.player.container.close()
-                    except Exception:
-                        pass
-                    self.player = None
-
+                self._close_player_safely()
                 gc.collect()
                 time.sleep(0.3)
                 continue
 
         if not opened and is_linux and os.path.exists(self.source):
             print(f"[FFMPEG CAMERA] Trying native auto-negotiated V4L2 format for {self.source}...")
+            self._close_player_safely()
             try:
                 self.player = MediaPlayer(self.source, format=fmt)
                 opened = True
                 print(f"[FFMPEG CAMERA] {self.name} opened with native V4L2 stream on {self.source} ✅")
             except Exception as e_native:
                 print(f"[FFMPEG CAMERA] Native V4L2 failed on {self.source}: {e_native}")
+                self._close_player_safely()
 
         if not opened:
             print(f"[FFMPEG CAMERA] Device {self.source} unavailable. Using synthetic fallback.")
@@ -186,22 +205,13 @@ class FFmpegCameraTrack(MediaStreamTrack):
 
     def stop_camera(self):
         print(f"[FFMPEG CAMERA] Releasing {self.name} resources ({self.source})...")
-        if self.player:
-            try:
-                if self.player.video:
-                    self.player.video.stop()
-            except Exception as e:
-                print(f"[FFMPEG CAMERA] video.stop() error for {self.name}: {e}")
-            try:
-                if self.player.audio:
-                    self.player.audio.stop()
-            except Exception as e:
-                print(f"[FFMPEG CAMERA] audio.stop() error for {self.name}: {e}")
-            self.player = None
+        self._close_player_safely()
         if self._fallback_track:
             self._fallback_track.stop_camera()
         gc.collect()
-        time.sleep(0.5)
+        time.sleep(DEVICE_RELEASE_COOLDOWN)
+        print(f"[FFMPEG CAMERA] {self.name} released ✅")
+
 
 def create_video_tracks(camera_mode: str = "all", quality: str = DEFAULT_QUALITY) -> List[MediaStreamTrack]:
     mode = (camera_mode or "all").lower()

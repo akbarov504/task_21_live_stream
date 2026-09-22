@@ -180,21 +180,28 @@ class WebRTCStreamSession:
         self.remote_set = False
         self.meta: Optional[Dict[str, Any]] = None
         self._disconnect_task: Optional[asyncio.Task] = None
+        self._lock = asyncio.Lock()
 
-    async def reset(self):
+    async def _release_tracks(self):
+        """Kamera va mikrofonni to'xtatadi. Kamera to'xtatish bloklovchi (sleep bor),
+        shuning uchun uni executor threadida bajaramiz — event loop qotib qolmasin."""
+        for vt in self.video_tracks:
+            if hasattr(vt, "stop_camera"):
+                await self.loop.run_in_executor(None, vt.stop_camera)
+        self.video_tracks.clear()
+
+        if self.mic_track:
+            await self.loop.run_in_executor(None, self.mic_track.stop_mic)
+            self.mic_track = None
+
+    async def _reset_locked(self):
+        """reset() ning ichki mantig'i. FAQAT self._lock allaqachon ushlangan joydan chaqiring."""
         print("[SESSION] Cleaning up session resources...")
         if self._disconnect_task and not self._disconnect_task.done():
             self._disconnect_task.cancel()
             self._disconnect_task = None
 
-        for vt in self.video_tracks:
-            if hasattr(vt, "stop_camera"):
-                vt.stop_camera()
-        self.video_tracks.clear()
-
-        if self.mic_track:
-            self.mic_track.stop_mic()
-            self.mic_track = None
+        await self._release_tracks()
 
         if self.pc:
             try:
@@ -208,45 +215,50 @@ class WebRTCStreamSession:
         self.meta = None
         print("[SESSION] Reset complete ✅")
 
+    async def reset(self):
+        async with self._lock:
+            await self._reset_locked()
+
     async def start_stream_and_offer(self, meta: dict, camera_mode: str = DEFAULT_CAMERA_MODE, quality: str = DEFAULT_QUALITY, audio_enabled: bool = ENABLE_AUDIO):
-        self.meta = meta
-        await self.reset()
+        async with self._lock:
+            self.meta = meta
+            await self._reset_locked()
 
-        self.pc = RTCPeerConnection(make_rtc_config())
+            self.pc = RTCPeerConnection(make_rtc_config())
 
-        self.video_tracks = create_video_tracks(camera_mode=camera_mode, quality=quality)
-        for vt in self.video_tracks:
-            self.pc.addTrack(vt)
+            self.video_tracks = create_video_tracks(camera_mode=camera_mode, quality=quality)
+            for vt in self.video_tracks:
+                self.pc.addTrack(vt)
 
-        if audio_enabled:
-            audio_dev = OUT_AUDIO_DEVICE if (camera_mode or "").lower() == "out" else IN_AUDIO_DEVICE
-            self.mic_track = MicrophoneTrack(self.loop, device=audio_dev)
-            self.pc.addTrack(self.mic_track)
+            if audio_enabled:
+                audio_dev = OUT_AUDIO_DEVICE if (camera_mode or "").lower() == "out" else IN_AUDIO_DEVICE
+                self.mic_track = MicrophoneTrack(self.loop, device=audio_dev)
+                self.pc.addTrack(self.mic_track)
 
-        self._attach_pc_events()
+            self._attach_pc_events()
 
-        offer = await self.pc.createOffer()
-        await self.pc.setLocalDescription(offer)
-        print(f"[SESSION] Local SDP OFFER created. Gathering state: {self.pc.iceGatheringState}")
+            offer = await self.pc.createOffer()
+            await self.pc.setLocalDescription(offer)
+            print(f"[SESSION] Local SDP OFFER created. Gathering state: {self.pc.iceGatheringState}")
 
-        offer_payload = {
-            "type":          "OFFER",
-            "sdp":           self.pc.localDescription.sdp,
-            "fromUsername":  meta.get("fromUsername"),
-            "fromSessionId": meta.get("fromSessionId"),
-            "serialNumber":  meta.get("serialNumber"),
-            "truckId":       meta.get("truckId"),
-            "driverId":      meta.get("driverId"),
-            "toUsername":    meta.get("toUsername"),
-            "toSessionId":   meta.get("toSessionId"),
-            "cameraMode":    camera_mode,
-            "quality":       quality,
-            "audio":         audio_enabled,
-        }
-        self.send_signal_cb(offer_payload)
-        print(f"[SESSION] OFFER sent to {meta.get('toSessionId')} 📡")
+            offer_payload = {
+                "type":          "OFFER",
+                "sdp":           self.pc.localDescription.sdp,
+                "fromUsername":  meta.get("fromUsername"),
+                "fromSessionId": meta.get("fromSessionId"),
+                "serialNumber":  meta.get("serialNumber"),
+                "truckId":       meta.get("truckId"),
+                "driverId":      meta.get("driverId"),
+                "toUsername":    meta.get("toUsername"),
+                "toSessionId":   meta.get("toSessionId"),
+                "cameraMode":    camera_mode,
+                "quality":       quality,
+                "audio":         audio_enabled,
+            }
+            self.send_signal_cb(offer_payload)
+            print(f"[SESSION] OFFER sent to {meta.get('toSessionId')} 📡")
 
-        self._send_ice_from_sdp(self.pc.localDescription.sdp)
+            self._send_ice_from_sdp(self.pc.localDescription.sdp)
 
     def _attach_pc_events(self):
         @self.pc.on("connectionstatechange")
@@ -365,42 +377,43 @@ class WebRTCStreamSession:
             print("[SESSION] addIceCandidate error:", e)
 
     async def handle_offer(self, offer_sdp: str, meta: dict, camera_mode: str = DEFAULT_CAMERA_MODE, quality: str = DEFAULT_QUALITY, audio_enabled: bool = ENABLE_AUDIO):
-        self.meta = meta
-        await self.reset()
+        async with self._lock:
+            self.meta = meta
+            await self._reset_locked()
 
-        self.pc = RTCPeerConnection(make_rtc_config())
+            self.pc = RTCPeerConnection(make_rtc_config())
 
-        self.video_tracks = create_video_tracks(camera_mode=camera_mode, quality=quality)
-        for vt in self.video_tracks:
-            self.pc.addTrack(vt)
+            self.video_tracks = create_video_tracks(camera_mode=camera_mode, quality=quality)
+            for vt in self.video_tracks:
+                self.pc.addTrack(vt)
 
-        if audio_enabled:
-            audio_dev = OUT_AUDIO_DEVICE if (camera_mode or "").lower() == "out" else IN_AUDIO_DEVICE
-            self.mic_track = MicrophoneTrack(self.loop, device=audio_dev)
-            self.pc.addTrack(self.mic_track)
+            if audio_enabled:
+                audio_dev = OUT_AUDIO_DEVICE if (camera_mode or "").lower() == "out" else IN_AUDIO_DEVICE
+                self.mic_track = MicrophoneTrack(self.loop, device=audio_dev)
+                self.pc.addTrack(self.mic_track)
 
-        self._attach_pc_events()
+            self._attach_pc_events()
 
-        await self.pc.setRemoteDescription(RTCSessionDescription(sdp=offer_sdp, type="offer"))
-        self.remote_set = True
+            await self.pc.setRemoteDescription(RTCSessionDescription(sdp=offer_sdp, type="offer"))
+            self.remote_set = True
 
-        answer = await self.pc.createAnswer()
-        await self.pc.setLocalDescription(answer)
+            answer = await self.pc.createAnswer()
+            await self.pc.setLocalDescription(answer)
 
-        answer_payload = {
-            "type":          "ANSWER",
-            "sdp":           self.pc.localDescription.sdp,
-            "fromUsername":  meta.get("fromUsername"),
-            "fromSessionId": meta.get("fromSessionId"),
-            "serialNumber":  meta.get("serialNumber"),
-            "truckId":       meta.get("truckId"),
-            "driverId":      meta.get("driverId"),
-            "toUsername":    meta.get("toUsername"),
-            "toSessionId":   meta.get("toSessionId"),
-        }
-        self.send_signal_cb(answer_payload)
-        print("[SESSION] Direct ANSWER sent to Web")
-        self._send_ice_from_sdp(self.pc.localDescription.sdp)
+            answer_payload = {
+                "type":          "ANSWER",
+                "sdp":           self.pc.localDescription.sdp,
+                "fromUsername":  meta.get("fromUsername"),
+                "fromSessionId": meta.get("fromSessionId"),
+                "serialNumber":  meta.get("serialNumber"),
+                "truckId":       meta.get("truckId"),
+                "driverId":      meta.get("driverId"),
+                "toUsername":    meta.get("toUsername"),
+                "toSessionId":   meta.get("toSessionId"),
+            }
+            self.send_signal_cb(answer_payload)
+            print("[SESSION] Direct ANSWER sent to Web")
+            self._send_ice_from_sdp(self.pc.localDescription.sdp)
 
 class WebRTCManager:
     def __init__(self, loop: asyncio.AbstractEventLoop, send_signal_cb, local_serial: str):
