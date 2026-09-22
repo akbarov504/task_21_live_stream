@@ -51,17 +51,6 @@ class LiveStreamApp:
         wrapped_body = json.dumps({"data": payload}, ensure_ascii=False)
         self.client.send(SEND_DEST, body=wrapped_body, content_type="application/json")
 
-        if to_sid:
-            t1 = f"{SIGNAL_TOPIC_BASE}/{to_user}/{to_sid}"
-            t2 = f"{SIGNAL_TOPIC_BASE}/{self.serial_number}/{to_sid}"
-            t3 = f"/topic/signal/{to_user}/{to_sid}"
-            t4 = f"/topic/signal/{self.serial_number}/{to_sid}"
-
-            self.client.send(t1, body=wrapped_body, content_type="application/json")
-            self.client.send(t2, body=wrapped_body, content_type="application/json")
-            self.client.send(t3, body=wrapped_body, content_type="application/json")
-            self.client.send(t4, body=wrapped_body, content_type="application/json")
-
         print(f"[SIGNAL OUT] Type: {sig_type} -> Sent to {to_sid} (user: {to_user}) via STOMP 📡")
 
     def on_connected(self, cli: SockJSTompClient):

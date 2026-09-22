@@ -183,8 +183,6 @@ class WebRTCStreamSession:
         self._lock = asyncio.Lock()
 
     async def _release_tracks(self):
-        """Kamera va mikrofonni to'xtatadi. Kamera to'xtatish bloklovchi (sleep bor),
-        shuning uchun uni executor threadida bajaramiz — event loop qotib qolmasin."""
         for vt in self.video_tracks:
             if hasattr(vt, "stop_camera"):
                 await self.loop.run_in_executor(None, vt.stop_camera)
@@ -195,7 +193,6 @@ class WebRTCStreamSession:
             self.mic_track = None
 
     async def _reset_locked(self):
-        """reset() ning ichki mantig'i. FAQAT self._lock allaqachon ushlangan joydan chaqiring."""
         print("[SESSION] Cleaning up session resources...")
         if self._disconnect_task and not self._disconnect_task.done():
             self._disconnect_task.cancel()
@@ -345,6 +342,10 @@ class WebRTCStreamSession:
     async def handle_answer(self, answer_sdp: str, meta: dict):
         if not self.pc:
             print("[SESSION] Error: Received ANSWER but PeerConnection is not initialized.")
+            return
+
+        if self.remote_set:
+            print("[SESSION] Duplicate ANSWER ignored (remote description already set)")
             return
 
         print("[SESSION] Setting remote SDP ANSWER...")

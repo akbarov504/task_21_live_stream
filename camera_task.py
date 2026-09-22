@@ -212,7 +212,6 @@ class FFmpegCameraTrack(MediaStreamTrack):
         time.sleep(DEVICE_RELEASE_COOLDOWN)
         print(f"[FFMPEG CAMERA] {self.name} released ✅")
 
-
 def create_video_tracks(camera_mode: str = "all", quality: str = DEFAULT_QUALITY) -> List[MediaStreamTrack]:
     mode = (camera_mode or "all").lower()
     print(f"[CAMERA FACTORY] Creating FFmpeg video track(s) for mode='{mode}', quality='{quality}'")

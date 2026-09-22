@@ -336,17 +336,10 @@
               btnStart.disabled = false;
               btnConnect.disabled = true;
 
-              const t1 = `${SIGNAL_TOPIC_BASE}/admin/${webSid}`;
-              const t2 = `${SIGNAL_TOPIC_BASE}/${serialNumber}/${webSid}`;
-              const t3 = `/topic/signal/admin/${webSid}`;
-              const t4 = `/topic/signal/${serialNumber}/${webSid}`;
+              const signalTopic = `${SIGNAL_TOPIC_BASE}/${serialNumber}/${webSid}`;
+              sockjsSend(buildFrame("SUBSCRIBE", { id: "sub-signal", destination: signalTopic, ack: "auto" }));
 
-              sockjsSend(buildFrame("SUBSCRIBE", { id: "sub-v1", destination: t1, ack: "auto" }));
-              sockjsSend(buildFrame("SUBSCRIBE", { id: "sub-v2", destination: t2, ack: "auto" }));
-              sockjsSend(buildFrame("SUBSCRIBE", { id: "sub-v3", destination: t3, ack: "auto" }));
-              sockjsSend(buildFrame("SUBSCRIBE", { id: "sub-v4", destination: t4, ack: "auto" }));
-
-              log(`SUBSCRIBED to signal topics ✅`);
+              log(`SUBSCRIBED to signal topic ✅: ${signalTopic}`);
               continue;
             }
 
@@ -384,16 +377,11 @@
     }
 
     function sendSignalToMiniPc(signalPayload) {
-      const serialNumber = document.getElementById("serialNumber").value.trim();
-      const miniSid = document.getElementById("miniSid").value.trim();
-
       const envelope = {
         data: signalPayload,
         ...signalPayload
       };
 
-      stompSendJson(`${SIGNAL_TOPIC_BASE}/${serialNumber}/${miniSid}`, envelope);
-      stompSendJson(`/topic/signal/${serialNumber}/${miniSid}`, envelope);
       stompSendJson(SEND_DEST, envelope);
     }
 
