@@ -109,23 +109,38 @@ class MicrophoneTrack(MediaStreamTrack):
         self._player: Optional[object] = None  # MediaPlayer
 
         dev_str = str(device).strip() if device else ""
-        print(f"[MIC] Opening audio via FFmpeg ALSA: device='{dev_str}'")
+        print(f"[MIC] Opening audio: device='{dev_str}'")
 
-        try:
-            if platform.system() == "Linux" and dev_str:
-                # ALSA device: "hw:3,0" yoki qurilma nomi
-                alsa_fmt = "alsa"
-                options = {
-                    "sample_rate": str(rate),
-                    "channels": "1",
-                }
-                self._player = MediaPlayer(dev_str, format=alsa_fmt, options=options)
-                print(f"[MIC] FFmpeg ALSA player opened ✅ (device='{dev_str}', {rate}Hz mono)")
+        self._player = None
+
+        if platform.system() == "Linux" and dev_str:
+            # PulseAudio virtual sink uchun urinishlar:
+            # 1) .monitor — sink ning monitoring output i (boshqa dastur yozgan audio ni oqish)
+            # 2) to'g'ridan-to'g'ri pulse source
+            # 3) ALSA hw: format (haqiqiy kartalar uchun)
+            candidates = []
+
+            if not dev_str.startswith("hw:") and not dev_str.startswith("plughw:"):
+                # PulseAudio virtual sink → monitor orqali o'qi
+                candidates.append(("pulse", f"{dev_str}.monitor"))
+                candidates.append(("pulse", dev_str))
             else:
-                raise RuntimeError(f"Non-Linux or empty device: '{dev_str}'")
-        except Exception as e:
-            print(f"[MIC] FFmpeg ALSA open failed: {e} — silent fallback ishlatilmoqda ⚠️")
-            self._player = None
+                # Haqiqiy ALSA device (hw:3,0 kabi)
+                candidates.append(("alsa", dev_str))
+
+            for fmt, src in candidates:
+                options = {"sample_rate": str(rate), "channels": "1"}
+                try:
+                    print(f"[MIC] Trying FFmpeg format='{fmt}' source='{src}'...")
+                    self._player = MediaPlayer(src, format=fmt, options=options)
+                    print(f"[MIC] Audio player opened ✅ (fmt={fmt}, src='{src}', {rate}Hz mono)")
+                    break
+                except Exception as e:
+                    print(f"[MIC] Failed (fmt={fmt}, src='{src}'): {e}")
+                    self._player = None
+
+        if self._player is None:
+            print(f"[MIC] All audio open attempts failed — silent fallback ⚠️")
             self._fallback = SilentAudioTrack(rate=self.rate, blocksize=self.blocksize)
 
     def stop_mic(self):
