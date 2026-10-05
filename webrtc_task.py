@@ -1,4 +1,5 @@
 import numpy as np
+import platform
 from av import AudioFrame
 from typing import Optional, List, Dict, Any
 from aiortc import (
@@ -9,8 +10,9 @@ from aiortc import (
     RTCConfiguration,
     RTCIceServer,
 )
+from aiortc.contrib.media import MediaPlayer
 from fractions import Fraction
-import json, asyncio, sounddevice
+import json, asyncio
 from aiortc.sdp import candidate_from_sdp
 from config import (
     ICE_SERVERS,
@@ -24,28 +26,6 @@ from config import (
     DEFAULT_QUALITY,
 )
 from camera_task import create_video_tracks
-
-def resolve_audio_device(dev):
-    if dev is None:
-        return None
-    try:
-        return int(dev)
-    except (ValueError, TypeError):
-        pass
-
-    dev_str = str(dev).strip()
-    try:
-        devices = sounddevice.query_devices()
-        for idx, d in enumerate(devices):
-            if d.get('max_input_channels', 0) > 0:
-                name = d.get('name', '')
-                if dev_str in name or (dev_str.startswith("hw:") and dev_str in name):
-                    print(f"[MIC] Resolved '{dev_str}' to sounddevice index {idx} ({name})")
-                    return idx
-    except Exception as e:
-        print(f"[MIC] Warning querying devices: {e}")
-
-    return dev_str
 
 def make_rtc_config() -> RTCConfiguration:
     servers_raw = json.loads(ICE_SERVERS)
@@ -88,86 +68,108 @@ def candidate_from_payload(cand_payload: dict) -> Optional[RTCIceCandidate]:
             return None
     return None
 
-class MicrophoneTrack(MediaStreamTrack):
+class SilentAudioTrack(MediaStreamTrack):
+    """Fallback — tovushsiz (jim) audio track."""
     kind = "audio"
 
-    def __init__(self, loop: asyncio.AbstractEventLoop, rate: int = AUDIO_RATE, device = None):
+    def __init__(self, rate: int = AUDIO_RATE, blocksize: int = 960):
+        super().__init__()
+        self.rate = rate
+        self.blocksize = blocksize
+        self._pts = 0
+
+    async def recv(self):
+        silent = np.zeros((1, self.blocksize), dtype=np.int16)
+        frame = AudioFrame.from_ndarray(silent, format="s16", layout="mono")
+        frame.sample_rate = self.rate
+        frame.pts = self._pts
+        frame.time_base = Fraction(1, self.rate)
+        self._pts += self.blocksize
+        return frame
+
+
+class MicrophoneTrack(MediaStreamTrack):
+    """FFmpeg MediaPlayer orqali virtual ALSA audio qurilmadan o'qiydi.
+    
+    sounddevice ishlatmaydi — shuning uchun PulseAudio/ALSA xatolari bo'lmaydi.
+    Agar qurilma ochilmasa yoki timeout bo'lsa — jim (silent) frame qaytaradi.
+    """
+    kind = "audio"
+
+    RECV_TIMEOUT = 3.0  # sekund
+
+    def __init__(self, loop: asyncio.AbstractEventLoop, rate: int = AUDIO_RATE, device=None):
         super().__init__()
         self.rate = rate
         self.blocksize = 960
         self._loop = loop
-        self._queue: asyncio.Queue = asyncio.Queue(maxsize=30)
         self._pts = 0
-        self._stopped = False
+        self._fallback: Optional[SilentAudioTrack] = None
+        self._consecutive_errors = 0
+        self._player: Optional[object] = None  # MediaPlayer
 
-        resolved_dev = resolve_audio_device(device)
-        print(f"[MIC] Initializing MicrophoneTrack with device={device} (resolved={resolved_dev})...")
+        dev_str = str(device).strip() if device else ""
+        print(f"[MIC] Opening audio via FFmpeg ALSA: device='{dev_str}'")
 
         try:
-            device_info = sounddevice.query_devices(resolved_dev, 'input')
-            max_ch = device_info.get('max_input_channels', 1)
+            if platform.system() == "Linux" and dev_str:
+                # ALSA device: "hw:3,0" yoki qurilma nomi
+                alsa_fmt = "alsa"
+                options = {
+                    "sample_rate": str(rate),
+                    "channels": "1",
+                }
+                self._player = MediaPlayer(dev_str, format=alsa_fmt, options=options)
+                print(f"[MIC] FFmpeg ALSA player opened ✅ (device='{dev_str}', {rate}Hz mono)")
+            else:
+                raise RuntimeError(f"Non-Linux or empty device: '{dev_str}'")
         except Exception as e:
-            print(f"[MIC] Query device warning ({e}), defaulting to mono on default mic")
-            resolved_dev = None
-            max_ch = 1
-
-        self.hardware_channels = 2 if max_ch >= 2 else 1
-
-        try:
-            self.stream = sounddevice.InputStream(
-                samplerate=self.rate,
-                channels=self.hardware_channels,
-                dtype="int16",
-                blocksize=self.blocksize,
-                latency="low",
-                callback=self._sd_callback,
-                device=resolved_dev,
-            )
-            self.stream.start()
-            print(f"[MIC] MicrophoneTrack started ✅ (device={resolved_dev}, {self.hardware_channels} ch -> Mono Opus)")
-        except Exception as e:
-            print(f"[MIC] Error starting microphone stream: {e}")
-            self.stream = None
-            self._stopped = True
-
-    def _sd_callback(self, indata, frames, time_info, status):
-        if self._stopped:
-            return
-        try:
-            mono_data = indata[:, 0].copy().reshape(1, -1)
-
-            def _put():
-                try:
-                    self._queue.put_nowait(mono_data)
-                except asyncio.QueueFull:
-                    pass
-            self._loop.call_soon_threadsafe(_put)
-        except Exception:
-            pass
+            print(f"[MIC] FFmpeg ALSA open failed: {e} — silent fallback ishlatilmoqda ⚠️")
+            self._player = None
+            self._fallback = SilentAudioTrack(rate=self.rate, blocksize=self.blocksize)
 
     def stop_mic(self):
-        self._stopped = True
-        if self.stream:
+        if self._player:
             try:
-                self.stream.stop()
-                self.stream.close()
+                if hasattr(self._player, "container") and self._player.container:
+                    self._player.container.close()
             except Exception as e:
-                print("[MIC] stop error:", e)
-            self.stream = None
+                print(f"[MIC] close error: {e}")
+            self._player = None
+        print("[MIC] Stopped.")
 
     async def recv(self):
-        if self._stopped or self.stream is None:
-            silent_data = np.zeros((1, self.blocksize), dtype=np.int16)
-            frame = AudioFrame.from_ndarray(silent_data, format="s16", layout="mono")
-        else:
-            data = await self._queue.get()
-            frame = AudioFrame.from_ndarray(data, format="s16", layout="mono")
+        # Real player dan o'qishga urinish
+        if self._player and self._player.audio:
+            try:
+                frame = await asyncio.wait_for(
+                    self._player.audio.recv(),
+                    timeout=self.RECV_TIMEOUT,
+                )
+                self._consecutive_errors = 0
+                frame.pts = self._pts
+                frame.time_base = Fraction(1, self.rate)
+                self._pts += frame.samples
+                return frame
+            except asyncio.TimeoutError:
+                self._consecutive_errors += 1
+                if self._consecutive_errors == 1:
+                    print(f"[MIC] recv() timeout ({self.RECV_TIMEOUT}s) — silent frame...")
+                if not self._fallback:
+                    self._fallback = SilentAudioTrack(rate=self.rate, blocksize=self.blocksize)
+                return await self._fallback.recv()
+            except Exception as e:
+                self._consecutive_errors += 1
+                if self._consecutive_errors == 1:
+                    print(f"[MIC] recv error: {e} — silent frame...")
+                if not self._fallback:
+                    self._fallback = SilentAudioTrack(rate=self.rate, blocksize=self.blocksize)
+                return await self._fallback.recv()
 
-        frame.sample_rate = self.rate
-        frame.pts = self._pts
-        frame.time_base = Fraction(1, self.rate)
-        self._pts += frame.samples
-        return frame
+        # Fallback — jim audio
+        if not self._fallback:
+            self._fallback = SilentAudioTrack(rate=self.rate, blocksize=self.blocksize)
+        return await self._fallback.recv()
 
 class WebRTCStreamSession:
     def __init__(self, loop: asyncio.AbstractEventLoop, send_signal_cb):
