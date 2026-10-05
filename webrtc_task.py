@@ -120,57 +120,105 @@ class MicrophoneTrack(MediaStreamTrack):
             print("[MIC] ffmpeg subprocess failed — silent fallback ⚠️")
             self._fallback = SilentAudioTrack(rate=self.rate, blocksize=self.blocksize)
 
-    def _build_ffmpeg_cmd(self, dev_str: str, rate: int):
-        """ALSA qurilma nomiga qarab ffmpeg argumentlarini tuzadi."""
-        bytes_per_sample = 2   # s16le
-        # hw:X,Y → to'g'ridan-to'g'ri ALSA
-        # boshqa nom → avval alsa sinab ko'r
-        alsa_candidates = []
-        if dev_str.startswith("hw:") or dev_str.startswith("plughw:"):
-            alsa_candidates = [dev_str]
-        else:
-            # Virtual ALSA loopback nomi (snd-aloop / custom driver)
-            alsa_candidates = [dev_str, f"hw:{dev_str}", f"plughw:{dev_str}"]
+    @staticmethod
+    def _build_command_candidates(dev_str: str, rate: int):
+        """
+        Sinab ko'riladigan subprocess buyruqlar ro'yxatini qaytaradi.
+        arecord birinchi — ALSA virtual PCM qurilmalar bilan eng mos keladi.
+        """
+        cmds = []
 
-        return alsa_candidates
+        # 1) arecord — ALSA virtual PCM uchun eng ishonchli usul.
+        #    Raw s16le PCM stdout ga chiqaradi, ffmpeg kerak emas.
+        cmds.append({
+            "label": f"arecord -D {dev_str}",
+            "cmd": [
+                "arecord",
+                "-D", dev_str,
+                "-f", "S16_LE",
+                "-r", str(rate),
+                "-c", "1",
+                "-t", "raw",
+                "-q",   # quiet: progress xabarlarini bosmaydi
+            ],
+        })
+
+        # 2) ffmpeg alsa — input parametrlarsiz (ALSA o'zi muzokaraga kirishadi)
+        cmds.append({
+            "label": f"ffmpeg -f alsa -i {dev_str}",
+            "cmd": [
+                "ffmpeg", "-loglevel", "error",
+                "-f", "alsa", "-i", dev_str,
+                "-ar", str(rate), "-ac", "1",
+                "-f", "s16le", "pipe:1",
+            ],
+        })
+
+        # 3) hw: format bilan ALSA direct access (karta raqami orqali)
+        if not (dev_str.startswith("hw:") or dev_str.startswith("plughw:")):
+            try:
+                import re
+                with open("/proc/asound/cards") as f:
+                    for line in f:
+                        if dev_str.lower() in line.lower():
+                            m = re.match(r'\s*(\d+)\s+\[', line)
+                            if m:
+                                n = m.group(1)
+                                cmds.append({
+                                    "label": f"arecord hw:{n},0",
+                                    "cmd": [
+                                        "arecord",
+                                        "-D", f"hw:{n},0",
+                                        "-f", "S16_LE", "-r", str(rate),
+                                        "-c", "1", "-t", "raw", "-q",
+                                    ],
+                                })
+                                cmds.append({
+                                    "label": f"ffmpeg plughw:{n},0",
+                                    "cmd": [
+                                        "ffmpeg", "-loglevel", "error",
+                                        "-f", "alsa", "-i", f"plughw:{n},0",
+                                        "-ar", str(rate), "-ac", "1",
+                                        "-f", "s16le", "pipe:1",
+                                    ],
+                                })
+            except Exception:
+                pass
+
+        return cmds
 
     def _start_subprocess(self, dev_str: str, rate: int):
         import subprocess
-        candidates = self._build_ffmpeg_cmd(dev_str, rate)
+        import time as _time
+        import threading
+
+        cmds = self._build_command_candidates(dev_str, rate)
         bytes_per_frame = self.blocksize * 2  # s16le mono
 
-        for alsa_src in candidates:
-            cmd = [
-                "ffmpeg", "-loglevel", "error",
-                "-f", "alsa",
-                "-i", alsa_src,
-                "-ar", str(rate),
-                "-ac", "1",
-                "-f", "s16le",
-                "pipe:1",
-            ]
-            print(f"[MIC] Trying: ffmpeg -f alsa -i '{alsa_src}' ...")
+        for entry in cmds:
+            label = entry["label"]
+            cmd = entry["cmd"]
+            print(f"[MIC] Trying: {label} ...")
             try:
                 proc = subprocess.Popen(
                     cmd,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
-                    bufsize=bytes_per_frame * 4,
+                    bufsize=bytes_per_frame * 8,
                 )
-                # 300ms kutib, process o'lmaganini tekshir
-                import time as _time
-                _time.sleep(0.3)
+                _time.sleep(0.5)
                 if proc.poll() is not None:
-                    err = proc.stderr.read(300).decode(errors="replace").strip()
-                    print(f"[MIC] ffmpeg exited early (src='{alsa_src}'): {err}")
-                    proc.stdout.close()
-                    proc.stderr.close()
+                    err = proc.stderr.read(500).decode(errors="replace").strip()
+                    print(f"[MIC] Failed ({label}): {err or 'process exited'}")
+                    try:
+                        proc.stdout.close()
+                        proc.stderr.close()
+                    except Exception:
+                        pass
                     continue
 
                 self._proc = proc
-                print(f"[MIC] ffmpeg audio subprocess started ✅ (src='{alsa_src}', {rate}Hz mono)")
-                # Background reader thread
-                import threading
+                print(f"[MIC] Audio subprocess started ✅ ({label}, {rate}Hz mono)")
                 t = threading.Thread(
                     target=self._read_loop,
                     args=(proc, bytes_per_frame),
@@ -179,12 +227,13 @@ class MicrophoneTrack(MediaStreamTrack):
                 t.start()
                 return
             except FileNotFoundError:
-                print("[MIC] ERROR: 'ffmpeg' binary topilmadi! PATH ni tekshir.")
-                return
+                bin_name = cmd[0]
+                print(f"[MIC] '{bin_name}' binary topilmadi, keyingisini sinayapman...")
+                continue
             except Exception as e:
-                print(f"[MIC] Popen error (src='{alsa_src}'): {e}")
+                print(f"[MIC] Popen error ({label}): {e}")
 
-        print("[MIC] Barcha ALSA source lar muvaffaqiyatsiz.")
+        print("[MIC] Barcha audio source urinishlari muvaffaqiyatsiz.")
 
     def _read_loop(self, proc, bytes_per_frame: int):
         """Background thread — ffmpeg stdout dan raw PCM o'qiydi."""
