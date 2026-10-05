@@ -1,3 +1,6 @@
+import os
+import subprocess
+import threading
 import numpy as np
 from av import AudioFrame
 from typing import Optional, List, Dict, Any
@@ -91,78 +94,110 @@ def candidate_from_payload(cand_payload: dict) -> Optional[RTCIceCandidate]:
 class MicrophoneTrack(MediaStreamTrack):
     kind = "audio"
 
-    def __init__(self, loop: asyncio.AbstractEventLoop, rate: int = AUDIO_RATE, device = None):
+    def __init__(self, loop: asyncio.AbstractEventLoop, rate: int = AUDIO_RATE, device=None):
         super().__init__()
         self.rate = rate
-        self.blocksize = 960
+        self.blocksize = rate // 50
         self._loop = loop
         self._queue: asyncio.Queue = asyncio.Queue(maxsize=30)
         self._pts = 0
         self._stopped = False
+        self._proc = None
+        self._thread = None
 
-        resolved_dev = resolve_audio_device(device)
-        print(f"[MIC] Initializing MicrophoneTrack with device={device} (resolved={resolved_dev})...")
+        source = str(device).strip() if device else None
+        print(f"[MIC] Initializing MicrophoneTrack (parec) with source={source}...")
+
+        cmd = [
+            "parec",
+            "--format=s16le",
+            f"--rate={self.rate}",
+            "--channels=1",
+            "--latency-msec=20",
+        ]
+        if source:
+            cmd.append(f"--device={source}")
+
+        env = {**os.environ}
+        env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
 
         try:
-            device_info = sounddevice.query_devices(resolved_dev, 'input')
-            max_ch = device_info.get('max_input_channels', 1)
-        except Exception as e:
-            print(f"[MIC] Query device warning ({e}), defaulting to mono on default mic")
-            resolved_dev = None
-            max_ch = 1
-
-        self.hardware_channels = 2 if max_ch >= 2 else 1
-
-        try:
-            self.stream = sounddevice.InputStream(
-                samplerate=self.rate,
-                channels=self.hardware_channels,
-                dtype="int16",
-                blocksize=self.blocksize,
-                latency="low",
-                callback=self._sd_callback,
-                device=resolved_dev,
+            self._proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                env=env,
+                bufsize=0,
             )
-            self.stream.start()
-            print(f"[MIC] MicrophoneTrack started ✅ (device={resolved_dev}, {self.hardware_channels} ch -> Mono Opus)")
+            self._thread = threading.Thread(target=self._reader, daemon=True)
+            self._thread.start()
+            print(f"[MIC] MicrophoneTrack started ✅ (source={source}, mono, {self.rate} Hz)")
         except Exception as e:
-            print(f"[MIC] Error starting microphone stream: {e}")
-            self.stream = None
+            print(f"[MIC] Error starting parec: {e}")
+            self._proc = None
             self._stopped = True
 
-    def _sd_callback(self, indata, frames, time_info, status):
-        if self._stopped:
-            return
+    def _put(self, data):
+        if self._queue.full():
+            try:
+                self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
         try:
-            mono_data = indata[:, 0].copy().reshape(1, -1)
-
-            def _put():
-                try:
-                    self._queue.put_nowait(mono_data)
-                except asyncio.QueueFull:
-                    pass
-            self._loop.call_soon_threadsafe(_put)
-        except Exception:
+            self._queue.put_nowait(data)
+        except asyncio.QueueFull:
             pass
+
+    def _reader(self):
+        nbytes = self.blocksize * 2
+        buf = b""
+        stdout = self._proc.stdout
+        while not self._stopped:
+            try:
+                chunk = stdout.read(nbytes - len(buf))
+            except Exception:
+                break
+            if not chunk:
+                break
+            buf += chunk
+            if len(buf) < nbytes:
+                continue
+            data = np.frombuffer(buf, dtype=np.int16).reshape(1, -1).copy()
+            buf = b""
+            try:
+                self._loop.call_soon_threadsafe(self._put, data)
+            except RuntimeError:
+                break
+        if not self._stopped:
+            print("[MIC] parec oqimi tugadi (source mavjudmi? `pactl list short sources`)")
 
     def stop_mic(self):
         self._stopped = True
-        if self.stream:
+        proc, self._proc = self._proc, None
+        if proc:
             try:
-                self.stream.stop()
-                self.stream.close()
-            except Exception as e:
-                print("[MIC] stop error:", e)
-            self.stream = None
+                proc.terminate()
+                proc.wait(timeout=2)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
 
     async def recv(self):
-        if self._stopped or self.stream is None:
-            silent_data = np.zeros((1, self.blocksize), dtype=np.int16)
-            frame = AudioFrame.from_ndarray(silent_data, format="s16", layout="mono")
+        silent = False
+        if self._stopped or self._proc is None:
+            await asyncio.sleep(self.blocksize / self.rate)
+            silent = True
         else:
-            data = await self._queue.get()
-            frame = AudioFrame.from_ndarray(data, format="s16", layout="mono")
+            try:
+                data = await asyncio.wait_for(self._queue.get(), timeout=1.0)
+            except asyncio.TimeoutError:
+                silent = True
 
+        if silent:
+            data = np.zeros((1, self.blocksize), dtype=np.int16)
+
+        frame = AudioFrame.from_ndarray(data, format="s16", layout="mono")
         frame.sample_rate = self.rate
         frame.pts = self._pts
         frame.time_base = Fraction(1, self.rate)
