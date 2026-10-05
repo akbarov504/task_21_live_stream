@@ -151,30 +151,140 @@ for dev in ["IN_VMIC", "OUT_VMIC"]:
 
 
 # ─────────────────────────────────────────────────────────
-# 5. Yozuvchi dastur ishlayaptimi?
+# 5. Mavjud ffmpeg processlar nima qilyapti?
 # ─────────────────────────────────────────────────────────
-header("5. IN_VMIC ga yozayotgan jarayon bormi?")
+header("5. Mavjud ffmpeg processlar (cmdline)")
+try:
+    import glob
+    for pid_dir in glob.glob("/proc/*/cmdline"):
+        try:
+            with open(pid_dir, 'rb') as f:
+                cmdline = f.read().replace(b'\x00', b' ').decode(errors='replace').strip()
+            if 'ffmpeg' in cmdline and ('alsa' in cmdline or 'hw:' in cmdline or 'vmic' in cmdline.lower()):
+                pid = pid_dir.split('/')[2]
+                print(f"  PID {pid}: {cmdline[:200]}")
+        except Exception:
+            pass
+except Exception as e:
+    warn(f"ffmpeg cmdline: {e}")
+
+
+# ─────────────────────────────────────────────────────────
+# 6. PulseAudio sources ro'yxati
+# ─────────────────────────────────────────────────────────
+header("6. PulseAudio sources (pactl list sources short)")
 try:
     out = subprocess.check_output(
-        ["bash", "-c", "lsof /dev/snd/* 2>/dev/null || fuser -v /dev/snd/* 2>&1 || echo 'topilmadi'"],
-        timeout=5
+        ["pactl", "list", "sources", "short"], stderr=subprocess.DEVNULL, timeout=5
     ).decode(errors="replace")
     print(out)
+    # Kamera/USB sourclarini ajratib ko'rsat
+    camera_sources = []
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) >= 2:
+            name = parts[1]
+            if any(k in name.lower() for k in ("camera", "usb", "arducam", "vmic")) and ".monitor" not in name:
+                camera_sources.append(name)
+                ok(f"Kamera source topildi: {name}")
+    if not camera_sources:
+        warn("Kamera/USB audio source topilmadi PulseAudio da")
 except Exception as e:
-    warn(f"jarayon tekshiruvi: {e}")
+    fail(f"pactl: {e}")
 
+
+# ─────────────────────────────────────────────────────────
+# 7. parecord test (PulseAudio capture)
+# ─────────────────────────────────────────────────────────
+header("7. parecord test (PulseAudio orqali)")
+
+# Avval pactl sources dan camera sourclarni topamiz
+pa_sources = []
 try:
-    # aplay -l → playback qurilmalarni ko'rish
-    out = subprocess.check_output(["aplay", "-l"], stderr=subprocess.DEVNULL, timeout=3)
-    lines = [l for l in out.decode(errors="replace").splitlines() if "vmic" in l.lower() or "VMIC" in l]
-    if lines:
-        info("aplay -l da VMIC qurilmalar:")
-        for l in lines:
-            print(f"    {l}")
-    else:
-        info("aplay -l da VMIC qurilmalar ko'rinmaydi (playback side)")
-except Exception as e:
-    warn(f"aplay -l: {e}")
+    out = subprocess.check_output(
+        ["pactl", "list", "sources", "short"], stderr=subprocess.DEVNULL, timeout=4
+    ).decode(errors="replace")
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) >= 2:
+            name = parts[1]
+            if ".monitor" not in name and any(k in name.lower() for k in ("camera", "arducam", "usb")):
+                pa_sources.append(name)
+except Exception:
+    pass
+
+if not pa_sources:
+    warn("pactl da kamera sourclar topilmadi, default sinayapman")
+    pa_sources = [None]  # default device
+
+for src in (pa_sources[:2] + [None])[:3]:  # max 3 sinash
+    label = src or "default"
+    cmd = ["parecord", f"--rate=48000", "--channels=1", "--format=s16le", "--raw"]
+    if src:
+        cmd.append(f"--device={src}")
+    print(f"\n  [{label}]")
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        time.sleep(0.8)
+        if proc.poll() is not None:
+            err = proc.stderr.read(300).decode(errors="replace").strip()
+            fail(f"parecord exited: {err or 'process exited'}")
+            continue
+        data = b""
+        deadline = time.time() + 1.0
+        while time.time() < deadline:
+            try:
+                chunk = proc.stdout.read1(4096) if hasattr(proc.stdout, "read1") else proc.stdout.read(4096)
+                if chunk:
+                    data += chunk
+            except Exception:
+                break
+        proc.terminate()
+        proc.wait(timeout=2)
+        if len(data) >= 1920:
+            ok(f"parecord muvaffaqiyatli! {len(data)} bayt olindi ✅")
+        else:
+            warn(f"parecord ochildi lekin kam ma'lumot: {len(data)} bayt")
+    except FileNotFoundError:
+        fail("parecord topilmadi (pulseaudio-utils o'rnatilmagan?)")
+        break
+    except Exception as e:
+        fail(f"parecord: {e}")
+
+
+# ─────────────────────────────────────────────────────────
+# 8. dsnoop test
+# ─────────────────────────────────────────────────────────
+header("8. dsnoop test (shared ALSA capture)")
+for card in ["Camera", "Camera_1"]:
+    dev = f"dsnoop:CARD={card},DEV=0"
+    cmd = ["arecord", "-D", dev, "-f", "S16_LE", "-r", "48000", "-c", "1", "-t", "raw", "-q"]
+    print(f"\n  [{dev}]")
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        time.sleep(0.8)
+        if proc.poll() is not None:
+            err = proc.stderr.read(300).decode(errors="replace").strip()
+            fail(f"dsnoop exited: {err or 'exited'}")
+            continue
+        data = b""
+        deadline = time.time() + 0.5
+        while time.time() < deadline:
+            try:
+                chunk = proc.stdout.read1(4096) if hasattr(proc.stdout, "read1") else proc.stdout.read(4096)
+                if chunk:
+                    data += chunk
+            except Exception:
+                break
+        proc.terminate()
+        proc.wait(timeout=2)
+        if len(data) >= 1920:
+            ok(f"dsnoop muvaffaqiyatli! {len(data)} bayt ✅  ← shu qurilmani ishlat!")
+        else:
+            warn(f"dsnoop ochildi lekin kam ma'lumot: {len(data)} bayt")
+    except Exception as e:
+        fail(f"dsnoop {card}: {e}")
+
 
 
 # ─────────────────────────────────────────────────────────

@@ -121,71 +121,109 @@ class MicrophoneTrack(MediaStreamTrack):
             self._fallback = SilentAudioTrack(rate=self.rate, blocksize=self.blocksize)
 
     @staticmethod
+    def _is_pulse_source(name: str) -> bool:
+        """Nom PulseAudio source nomimi (hw:/plughw: emas)?"""
+        return not (name.startswith("hw:") or name.startswith("plughw:") or name.startswith("/dev/"))
+
+    @staticmethod
     def _build_command_candidates(dev_str: str, rate: int):
         """
         Sinab ko'riladigan subprocess buyruqlar ro'yxatini qaytaradi.
-        arecord birinchi — ALSA virtual PCM qurilmalar bilan eng mos keladi.
+        Tartib:
+          1. parecord dev_str bilan (PulseAudio source/monitor)
+          2. parecord pactl dan topilgan boshqa sourclar
+          3. arecord dsnoop (shared ALSA)
+          4. arecord direct
+          5. ffmpeg alsa fallback
         """
+        import subprocess as sp
         cmds = []
 
-        # 1) arecord — ALSA virtual PCM uchun eng ishonchli usul.
-        #    Raw s16le PCM stdout ga chiqaradi, ffmpeg kerak emas.
+        # ── 1. parecord — dev_str ni to'g'ridan-to'g'ri PulseAudio source sifatida ──
+        # IN_VMIC_SINK.monitor, OUT_VMIC_SINK.monitor kabi nomlar shu yerda ishlaydi
+        if MicrophoneTrack._is_pulse_source(dev_str):
+            cmds.append({
+                "label": f"parecord {dev_str}",
+                "cmd": [
+                    "parecord",
+                    f"--device={dev_str}",
+                    f"--rate={rate}",
+                    "--channels=1",
+                    "--format=s16le",
+                    "--raw",
+                ],
+            })
+
+        # ── 2. parecord — pactl sources dan qo'shimcha candidatlar ──
+        # (faqat dev_str bilan bir xil bo'lmaganlar)
+        try:
+            out = sp.check_output(
+                ["pactl", "list", "sources", "short"],
+                stderr=sp.DEVNULL, timeout=4,
+            ).decode(errors="replace")
+            for line in out.splitlines():
+                parts = line.split()
+                if len(parts) < 2:
+                    continue
+                src_name = parts[1]
+                if src_name == dev_str:
+                    continue  # 1-bandda allaqachon qo'shildi
+                # Hint: dev_str nomini o'z ichiga olgan sourcelar
+                hint_base = dev_str.replace("_SINK.monitor", "").replace(".monitor", "")
+                if hint_base.lower() in src_name.lower():
+                    cmds.append({
+                        "label": f"parecord {src_name}",
+                        "cmd": [
+                            "parecord", f"--device={src_name}",
+                            f"--rate={rate}", "--channels=1",
+                            "--format=s16le", "--raw",
+                        ],
+                    })
+        except Exception:
+            pass
+
+        # ── 3. parecord default ──
         cmds.append({
-            "label": f"arecord -D {dev_str}",
-            "cmd": [
-                "arecord",
-                "-D", dev_str,
-                "-f", "S16_LE",
-                "-r", str(rate),
-                "-c", "1",
-                "-t", "raw",
-                "-q",   # quiet: progress xabarlarini bosmaydi
-            ],
+            "label": "parecord (default)",
+            "cmd": ["parecord", f"--rate={rate}", "--channels=1", "--format=s16le", "--raw"],
         })
 
-        # 2) ffmpeg alsa — input parametrlarsiz (ALSA o'zi muzokaraga kirishadi)
-        cmds.append({
-            "label": f"ffmpeg -f alsa -i {dev_str}",
-            "cmd": [
-                "ffmpeg", "-loglevel", "error",
-                "-f", "alsa", "-i", dev_str,
-                "-ar", str(rate), "-ac", "1",
-                "-f", "s16le", "pipe:1",
-            ],
-        })
+        # ── 4. arecord dsnoop — shared ALSA capture ──
+        for card_name in ("Camera", "Camera_1"):
+            cmds.append({
+                "label": f"arecord dsnoop:{card_name}",
+                "cmd": [
+                    "arecord", "-D", f"dsnoop:CARD={card_name},DEV=0",
+                    "-f", "S16_LE", "-r", str(rate),
+                    "-c", "1", "-t", "raw", "-q",
+                ],
+            })
 
-        # 3) hw: format bilan ALSA direct access (karta raqami orqali)
-        if not (dev_str.startswith("hw:") or dev_str.startswith("plughw:")):
-            try:
-                import re
-                with open("/proc/asound/cards") as f:
-                    for line in f:
-                        if dev_str.lower() in line.lower():
-                            m = re.match(r'\s*(\d+)\s+\[', line)
-                            if m:
-                                n = m.group(1)
-                                cmds.append({
-                                    "label": f"arecord hw:{n},0",
-                                    "cmd": [
-                                        "arecord",
-                                        "-D", f"hw:{n},0",
-                                        "-f", "S16_LE", "-r", str(rate),
-                                        "-c", "1", "-t", "raw", "-q",
-                                    ],
-                                })
-                                cmds.append({
-                                    "label": f"ffmpeg plughw:{n},0",
-                                    "cmd": [
-                                        "ffmpeg", "-loglevel", "error",
-                                        "-f", "alsa", "-i", f"plughw:{n},0",
-                                        "-ar", str(rate), "-ac", "1",
-                                        "-f", "s16le", "pipe:1",
-                                    ],
-                                })
-            except Exception:
-                pass
+        # ── 5. arecord direct (ALSA PCM agar hw: yoki plughw: bo'lsa) ──
+        if not MicrophoneTrack._is_pulse_source(dev_str):
+            cmds.append({
+                "label": f"arecord -D {dev_str}",
+                "cmd": [
+                    "arecord", "-D", dev_str,
+                    "-f", "S16_LE", "-r", str(rate),
+                    "-c", "1", "-t", "raw", "-q",
+                ],
+            })
+
+        # ── 6. ffmpeg alsa fallback ──
+        if not MicrophoneTrack._is_pulse_source(dev_str):
+            cmds.append({
+                "label": f"ffmpeg alsa {dev_str}",
+                "cmd": [
+                    "ffmpeg", "-loglevel", "error",
+                    "-f", "alsa", "-i", dev_str,
+                    "-ar", str(rate), "-ac", "1",
+                    "-f", "s16le", "pipe:1",
+                ],
+            })
 
         return cmds
+
 
     def _start_subprocess(self, dev_str: str, rate: int):
         import subprocess
