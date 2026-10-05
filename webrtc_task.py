@@ -89,102 +89,169 @@ class SilentAudioTrack(MediaStreamTrack):
 
 
 class MicrophoneTrack(MediaStreamTrack):
-    """FFmpeg MediaPlayer orqali virtual ALSA audio qurilmadan o'qiydi.
-    
-    sounddevice ishlatmaydi — shuning uchun PulseAudio/ALSA xatolari bo'lmaydi.
-    Agar qurilma ochilmasa yoki timeout bo'lsa — jim (silent) frame qaytaradi.
+    """Tizim ffmpeg binary orqali ALSA virtual qurilmadan audio o'qiydi.
+
+    aiortc MediaPlayer ishlatmaydi (tizimda pulse/alsa format yo'q).
+    Buning o'rniga: ffmpeg subprocess → stdout pipe → raw s16le PCM → asyncio queue.
+    Agar qurilma ochilmasa — jim (silent) frame qaytaradi.
     """
     kind = "audio"
-
-    RECV_TIMEOUT = 3.0  # sekund
 
     def __init__(self, loop: asyncio.AbstractEventLoop, rate: int = AUDIO_RATE, device=None):
         super().__init__()
         self.rate = rate
-        self.blocksize = 960
+        self.blocksize = 960          # 20ms @ 48kHz
         self._loop = loop
         self._pts = 0
-        self._fallback: Optional[SilentAudioTrack] = None
+        self._queue: asyncio.Queue = asyncio.Queue(maxsize=50)
+        self._proc = None
+        self._reader_task = None
+        self._stopped = False
         self._consecutive_errors = 0
-        self._player: Optional[object] = None  # MediaPlayer
+        self._fallback: Optional[SilentAudioTrack] = None
 
         dev_str = str(device).strip() if device else ""
-        print(f"[MIC] Opening audio: device='{dev_str}'")
-
-        self._player = None
+        print(f"[MIC] Opening audio via ffmpeg subprocess: device='{dev_str}'")
 
         if platform.system() == "Linux" and dev_str:
-            # PulseAudio virtual sink uchun urinishlar:
-            # 1) .monitor — sink ning monitoring output i (boshqa dastur yozgan audio ni oqish)
-            # 2) to'g'ridan-to'g'ri pulse source
-            # 3) ALSA hw: format (haqiqiy kartalar uchun)
-            candidates = []
+            self._start_subprocess(dev_str, rate)
 
-            if not dev_str.startswith("hw:") and not dev_str.startswith("plughw:"):
-                # PulseAudio virtual sink → monitor orqali o'qi
-                candidates.append(("pulse", f"{dev_str}.monitor"))
-                candidates.append(("pulse", dev_str))
-            else:
-                # Haqiqiy ALSA device (hw:3,0 kabi)
-                candidates.append(("alsa", dev_str))
-
-            for fmt, src in candidates:
-                options = {"sample_rate": str(rate), "channels": "1"}
-                try:
-                    print(f"[MIC] Trying FFmpeg format='{fmt}' source='{src}'...")
-                    self._player = MediaPlayer(src, format=fmt, options=options)
-                    print(f"[MIC] Audio player opened ✅ (fmt={fmt}, src='{src}', {rate}Hz mono)")
-                    break
-                except Exception as e:
-                    print(f"[MIC] Failed (fmt={fmt}, src='{src}'): {e}")
-                    self._player = None
-
-        if self._player is None:
-            print(f"[MIC] All audio open attempts failed — silent fallback ⚠️")
+        if self._proc is None:
+            print("[MIC] ffmpeg subprocess failed — silent fallback ⚠️")
             self._fallback = SilentAudioTrack(rate=self.rate, blocksize=self.blocksize)
 
-    def stop_mic(self):
-        if self._player:
+    def _build_ffmpeg_cmd(self, dev_str: str, rate: int):
+        """ALSA qurilma nomiga qarab ffmpeg argumentlarini tuzadi."""
+        bytes_per_sample = 2   # s16le
+        # hw:X,Y → to'g'ridan-to'g'ri ALSA
+        # boshqa nom → avval alsa sinab ko'r
+        alsa_candidates = []
+        if dev_str.startswith("hw:") or dev_str.startswith("plughw:"):
+            alsa_candidates = [dev_str]
+        else:
+            # Virtual ALSA loopback nomi (snd-aloop / custom driver)
+            alsa_candidates = [dev_str, f"hw:{dev_str}", f"plughw:{dev_str}"]
+
+        return alsa_candidates
+
+    def _start_subprocess(self, dev_str: str, rate: int):
+        import subprocess
+        candidates = self._build_ffmpeg_cmd(dev_str, rate)
+        bytes_per_frame = self.blocksize * 2  # s16le mono
+
+        for alsa_src in candidates:
+            cmd = [
+                "ffmpeg", "-loglevel", "error",
+                "-f", "alsa",
+                "-i", alsa_src,
+                "-ar", str(rate),
+                "-ac", "1",
+                "-f", "s16le",
+                "pipe:1",
+            ]
+            print(f"[MIC] Trying: ffmpeg -f alsa -i '{alsa_src}' ...")
             try:
-                if hasattr(self._player, "container") and self._player.container:
-                    self._player.container.close()
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    bufsize=bytes_per_frame * 4,
+                )
+                # 300ms kutib, process o'lmaganini tekshir
+                import time as _time
+                _time.sleep(0.3)
+                if proc.poll() is not None:
+                    err = proc.stderr.read(300).decode(errors="replace").strip()
+                    print(f"[MIC] ffmpeg exited early (src='{alsa_src}'): {err}")
+                    proc.stdout.close()
+                    proc.stderr.close()
+                    continue
+
+                self._proc = proc
+                print(f"[MIC] ffmpeg audio subprocess started ✅ (src='{alsa_src}', {rate}Hz mono)")
+                # Background reader thread
+                import threading
+                t = threading.Thread(
+                    target=self._read_loop,
+                    args=(proc, bytes_per_frame),
+                    daemon=True,
+                )
+                t.start()
+                return
+            except FileNotFoundError:
+                print("[MIC] ERROR: 'ffmpeg' binary topilmadi! PATH ni tekshir.")
+                return
             except Exception as e:
-                print(f"[MIC] close error: {e}")
-            self._player = None
+                print(f"[MIC] Popen error (src='{alsa_src}'): {e}")
+
+        print("[MIC] Barcha ALSA source lar muvaffaqiyatsiz.")
+
+    def _read_loop(self, proc, bytes_per_frame: int):
+        """Background thread — ffmpeg stdout dan raw PCM o'qiydi."""
+        try:
+            while not self._stopped:
+                data = proc.stdout.read(bytes_per_frame)
+                if not data:
+                    break
+                if len(data) < bytes_per_frame:
+                    # To'liq frame bo'lmasa — to'ldirish
+                    data = data + b'\x00' * (bytes_per_frame - len(data))
+
+                arr = np.frombuffer(data, dtype=np.int16).reshape(1, -1)
+
+                def _put(a=arr):
+                    try:
+                        self._queue.put_nowait(a)
+                    except asyncio.QueueFull:
+                        pass  # Orqada qolgan frame ni tashlaymiz
+
+                self._loop.call_soon_threadsafe(_put)
+        except Exception as e:
+            if not self._stopped:
+                print(f"[MIC] read_loop error: {e}")
+        finally:
+            print("[MIC] ffmpeg read loop tugadi.")
+
+    def stop_mic(self):
+        self._stopped = True
+        if self._proc:
+            try:
+                self._proc.terminate()
+                self._proc.wait(timeout=2)
+            except Exception:
+                try:
+                    self._proc.kill()
+                except Exception:
+                    pass
+            self._proc = None
         print("[MIC] Stopped.")
 
     async def recv(self):
-        # Real player dan o'qishga urinish
-        if self._player and self._player.audio:
-            try:
-                frame = await asyncio.wait_for(
-                    self._player.audio.recv(),
-                    timeout=self.RECV_TIMEOUT,
-                )
-                self._consecutive_errors = 0
-                frame.pts = self._pts
-                frame.time_base = Fraction(1, self.rate)
-                self._pts += frame.samples
-                return frame
-            except asyncio.TimeoutError:
-                self._consecutive_errors += 1
-                if self._consecutive_errors == 1:
-                    print(f"[MIC] recv() timeout ({self.RECV_TIMEOUT}s) — silent frame...")
-                if not self._fallback:
-                    self._fallback = SilentAudioTrack(rate=self.rate, blocksize=self.blocksize)
-                return await self._fallback.recv()
-            except Exception as e:
-                self._consecutive_errors += 1
-                if self._consecutive_errors == 1:
-                    print(f"[MIC] recv error: {e} — silent frame...")
-                if not self._fallback:
-                    self._fallback = SilentAudioTrack(rate=self.rate, blocksize=self.blocksize)
-                return await self._fallback.recv()
+        if self._fallback:
+            return await self._fallback.recv()
 
-        # Fallback — jim audio
-        if not self._fallback:
-            self._fallback = SilentAudioTrack(rate=self.rate, blocksize=self.blocksize)
-        return await self._fallback.recv()
+        try:
+            arr = await asyncio.wait_for(self._queue.get(), timeout=3.0)
+            self._consecutive_errors = 0
+            frame = AudioFrame.from_ndarray(arr, format="s16", layout="mono")
+        except asyncio.TimeoutError:
+            self._consecutive_errors += 1
+            if self._consecutive_errors == 1:
+                print("[MIC] recv timeout — silent frame...")
+            arr = np.zeros((1, self.blocksize), dtype=np.int16)
+            frame = AudioFrame.from_ndarray(arr, format="s16", layout="mono")
+        except Exception as e:
+            self._consecutive_errors += 1
+            if self._consecutive_errors == 1:
+                print(f"[MIC] recv error: {e}")
+            arr = np.zeros((1, self.blocksize), dtype=np.int16)
+            frame = AudioFrame.from_ndarray(arr, format="s16", layout="mono")
+
+        frame.sample_rate = self.rate
+        frame.pts = self._pts
+        frame.time_base = Fraction(1, self.rate)
+        self._pts += self.blocksize
+        return frame
 
 class WebRTCStreamSession:
     def __init__(self, loop: asyncio.AbstractEventLoop, send_signal_cb):
